@@ -1468,7 +1468,7 @@ def export_eval_model(config: Dict[str, Any], tokenizer: Any, model: torch.nn.Mo
     write_json(export_dir / "config.json", hf_config)
     shutil.copy2(Path(__file__).with_name("hf_lightlm.py"), export_dir / "hf_lightlm.py")
     shutil.copy2(Path(__file__).with_name("model.py"), export_dir / "model.py")
-    return str(export_dir)
+    return str(export_dir.resolve())
 
 
 def run_bigcode_eval(
@@ -1480,26 +1480,27 @@ def run_bigcode_eval(
     checkpoint_path: Optional[Path],
     manifest: Dict[str, Any],
     force: bool = False,
-) -> None:
+) -> bool:
     eval_cfg = config["evaluation"]["bigcode_harness"]
     if not eval_cfg.get("enabled", False):
-        return
+        return True
     next_eval = int(manifest.get("next_eval_tokens") or eval_cfg.get("interval_tokens", 0))
     if not force and tokens_trained < next_eval:
-        return
+        return True
 
     eval_model = eval_cfg.get("eval_model", "{output_dir}")
-    output_dir = config["paths"]["output_dir"]
+    output_dir = str(Path(config["paths"]["output_dir"]).resolve())
     eval_model = eval_model.format(output_dir=output_dir, step=global_step, tokens=tokens_trained)
     if eval_model == output_dir:
         eval_model = export_eval_model(config, tokenizer, model)
+    checkpoint = str(checkpoint_path.resolve()) if checkpoint_path else ""
 
     command = [
         part.format(
             output_dir=output_dir,
             step=global_step,
             tokens=tokens_trained,
-            checkpoint=str(checkpoint_path or ""),
+            checkpoint=checkpoint,
             eval_model=eval_model,
         )
         for part in eval_cfg.get("command", [])
@@ -1517,7 +1518,7 @@ def run_bigcode_eval(
     )
     if not command:
         append_jsonl(log_path, {"event": "bigcode_eval_skipped", "reason": "empty command", "time": utc_now()})
-        return
+        return False
 
     cwd = eval_cfg.get("cwd") or None
     if cwd and not (Path(cwd) / "main.py").exists():
@@ -1531,7 +1532,7 @@ def run_bigcode_eval(
                 "time": utc_now(),
             },
         )
-        return
+        return False
     with log_path.open("a", encoding="utf-8") as f:
         f.write(json.dumps({"event": "bigcode_eval_stdout_begin", "step": global_step}) + "\n")
         result = subprocess.run(command, cwd=cwd, stdout=f, stderr=subprocess.STDOUT, text=True, check=False)
@@ -1546,6 +1547,8 @@ def run_bigcode_eval(
             "time": utc_now(),
         },
     )
+    if result.returncode != 0:
+        return False
     interval = int(eval_cfg["interval_tokens"])
     if force and next_eval <= tokens_trained:
         next_eval = tokens_trained + interval
@@ -1553,6 +1556,7 @@ def run_bigcode_eval(
         while next_eval <= tokens_trained:
             next_eval += interval
     manifest["next_eval_tokens"] = next_eval
+    return True
 
 
 def mark_shard_status(config: Dict[str, Any], shard_id: int, status: str, **extra: Any) -> None:
@@ -1798,7 +1802,7 @@ def main() -> None:
             config["evaluation"]["bigcode_harness"].get("enabled", False)
             and not manifest.get("initial_eval_done", False)
         ):
-            run_bigcode_eval(
+            eval_ok = run_bigcode_eval(
                 config,
                 tokenizer,
                 model,
@@ -1808,10 +1812,14 @@ def main() -> None:
                 manifest,
                 force=True,
             )
-            manifest["initial_eval_done"] = True
+            if eval_ok:
+                manifest["initial_eval_done"] = True
+                print("Initial BigCode eval completed.")
+            else:
+                manifest["initial_eval_done"] = False
+                print("Initial BigCode eval failed or was skipped; see eval log.")
             manifest["updated_at"] = utc_now()
             write_json(manifest_path, manifest)
-            print("Initial BigCode eval completed or logged as skipped.")
 
     run_rank0_stage(config, "startup", startup_rank0_stage)
 
