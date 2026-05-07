@@ -192,8 +192,10 @@ def find_latest_checkpoint(checkpoint_dir: Path) -> Optional[Path]:
     return checkpoints[-1] if checkpoints else None
 
 
-def load_checkpoint_file(path_or_repo: str) -> Dict[str, Any]:
+def load_checkpoint_file(path_or_repo: str, subfolder: str = "") -> Dict[str, Any]:
     path = Path(path_or_repo)
+    if path.exists() and subfolder:
+        path = path / subfolder
     if path.exists():
         if path.is_dir():
             for name in ("model.safetensors", "pytorch_model.bin"):
@@ -209,7 +211,7 @@ def load_checkpoint_file(path_or_repo: str) -> Dict[str, Any]:
 
     for filename in ("model.safetensors", "pytorch_model.bin"):
         try:
-            downloaded = hf_hub_download(repo_id=path_or_repo, filename=filename)
+            downloaded = hf_hub_download(repo_id=path_or_repo, filename=filename, subfolder=subfolder or None)
             if filename.endswith(".safetensors"):
                 if load_safetensors is None:
                     raise RuntimeError("Install safetensors to load .safetensors checkpoints.")
@@ -217,7 +219,8 @@ def load_checkpoint_file(path_or_repo: str) -> Dict[str, Any]:
             return torch.load(downloaded, map_location="cpu")
         except Exception:
             continue
-    raise FileNotFoundError(f"Could not find a PyTorch checkpoint in {path_or_repo!r}.")
+    location = f"{path_or_repo}/{subfolder}" if subfolder else path_or_repo
+    raise FileNotFoundError(f"Could not find a PyTorch checkpoint in {location!r}.")
 
 
 def load_state_into_model(model: Transformer, checkpoint: Dict[str, Any]) -> Dict[str, Any]:
@@ -304,7 +307,10 @@ def build_tokenizer_and_model(config: Dict[str, Any], device: torch.device) -> T
             print(f"Resumed CPT checkpoint: {resume_path}")
             print(f"Loaded tensors: {info['compatible_tensors']}, partial: {info['partial_tensors']}")
     else:
-        base_checkpoint = load_checkpoint_file(config["model"]["base_checkpoint"])
+        base_checkpoint = load_checkpoint_file(
+            config["model"]["base_checkpoint"],
+            config["model"].get("base_checkpoint_subfolder", ""),
+        )
         info = load_state_into_model(model, base_checkpoint)
         init_special_embeddings(model, tokenizer, old_vocab_size, config["special_tokens"])
         if rank0():
@@ -951,7 +957,16 @@ def save_checkpoint(
         },
         path,
     )
+    prune_checkpoints(checkpoint_dir, int(config["training"].get("max_checkpoints_to_keep", 0)))
     return path
+
+
+def prune_checkpoints(checkpoint_dir: Path, max_to_keep: int) -> None:
+    if max_to_keep <= 0:
+        return
+    checkpoints = sorted(checkpoint_dir.glob("cpt_step_*.pt"))
+    for checkpoint in checkpoints[:-max_to_keep]:
+        checkpoint.unlink()
 
 
 def load_resume_state(config: Dict[str, Any]) -> Dict[str, Any]:
