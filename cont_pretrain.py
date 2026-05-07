@@ -11,8 +11,9 @@ import time
 from collections import defaultdict
 from contextlib import nullcontext
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
+from urllib.parse import unquote
 
 import numpy as np
 import torch
@@ -21,7 +22,7 @@ import torch.nn.functional as F
 from datasets import load_dataset
 from datatrove.pipeline.tokens.tokenizer import TokenizedFile
 from datatrove.utils.dataset import DatatroveFolderDataset
-from huggingface_hub import hf_hub_download
+from huggingface_hub import hf_hub_download, list_repo_files
 from torch.nn.parallel import DistributedDataParallel as DDP
 from transformers import AutoTokenizer
 
@@ -192,7 +193,52 @@ def find_latest_checkpoint(checkpoint_dir: Path) -> Optional[Path]:
     return checkpoints[-1] if checkpoints else None
 
 
+def split_hf_location(path_or_repo: str, subfolder: str = "") -> Tuple[str, str, Optional[str]]:
+    marker = "huggingface.co/"
+    if marker not in path_or_repo:
+        return path_or_repo, subfolder, None
+
+    tail = unquote(path_or_repo.split(marker, 1)[1].strip("/"))
+    parts = tail.split("/")
+    if len(parts) < 2:
+        return path_or_repo, subfolder, None
+
+    repo_id = "/".join(parts[:2])
+    if len(parts) >= 4 and parts[2] in {"tree", "blob"}:
+        path_inside_repo = "/".join(parts[4:])
+        if parts[2] == "tree":
+            return repo_id, path_inside_repo, None
+        repo_path = PurePosixPath(path_inside_repo)
+        return repo_id, str(repo_path.parent), repo_path.name
+    return repo_id, subfolder, None
+
+
+def checkpoint_candidates(repo_id: str, subfolder: str = "") -> List[str]:
+    suffixes = (".safetensors", ".bin", ".pt", ".pth")
+    files = list_repo_files(repo_id=repo_id, repo_type="model")
+    prefix = subfolder.strip("/")
+    if prefix:
+        files = [file for file in files if file.startswith(prefix + "/")]
+    candidates = [file for file in files if file.endswith(suffixes)]
+
+    preferred_names = (
+        "model.safetensors",
+        "pytorch_model.bin",
+        "model.pt",
+        "checkpoint.pt",
+    )
+    return sorted(
+        candidates,
+        key=lambda file: (
+            Path(file).name not in preferred_names,
+            not file.endswith(".safetensors"),
+            file,
+        ),
+    )
+
+
 def load_checkpoint_file(path_or_repo: str, subfolder: str = "") -> Dict[str, Any]:
+    path_or_repo, subfolder, exact_filename = split_hf_location(path_or_repo, subfolder)
     path = Path(path_or_repo)
     if path.exists() and subfolder:
         path = path / subfolder
@@ -207,20 +253,35 @@ def load_checkpoint_file(path_or_repo: str, subfolder: str = "") -> Dict[str, An
             if load_safetensors is None:
                 raise RuntimeError("Install safetensors to load .safetensors checkpoints.")
             return {"model": load_safetensors(str(path))}
-        return torch.load(path, map_location="cpu")
+        return torch.load(path, map_location="cpu", weights_only=False)
 
-    for filename in ("model.safetensors", "pytorch_model.bin"):
+    filenames = []
+    if exact_filename:
+        filenames.append("/".join(part for part in [subfolder.strip("/"), exact_filename] if part))
+    else:
         try:
-            downloaded = hf_hub_download(repo_id=path_or_repo, filename=filename, subfolder=subfolder or None)
+            filenames.extend(checkpoint_candidates(path_or_repo, subfolder))
+        except Exception:
+            filenames.extend(
+                "/".join(part for part in [subfolder.strip("/"), filename] if part)
+                for filename in ("model.safetensors", "pytorch_model.bin", "model.pt", "checkpoint.pt")
+            )
+
+    for filename in filenames:
+        try:
+            downloaded = hf_hub_download(repo_id=path_or_repo, filename=filename)
             if filename.endswith(".safetensors"):
                 if load_safetensors is None:
                     raise RuntimeError("Install safetensors to load .safetensors checkpoints.")
                 return {"model": load_safetensors(downloaded)}
-            return torch.load(downloaded, map_location="cpu")
+            return torch.load(downloaded, map_location="cpu", weights_only=False)
         except Exception:
             continue
     location = f"{path_or_repo}/{subfolder}" if subfolder else path_or_repo
-    raise FileNotFoundError(f"Could not find a PyTorch checkpoint in {location!r}.")
+    raise FileNotFoundError(
+        f"Could not find a checkpoint in {location!r}. "
+        f"Tried: {filenames or 'no checkpoint-like files found'}"
+    )
 
 
 def load_state_into_model(model: Transformer, checkpoint: Dict[str, Any]) -> Dict[str, Any]:
@@ -301,7 +362,7 @@ def build_tokenizer_and_model(config: Dict[str, Any], device: torch.device) -> T
             resume_path = candidate
 
     if resume_path:
-        checkpoint = torch.load(resume_path, map_location="cpu")
+        checkpoint = torch.load(resume_path, map_location="cpu", weights_only=False)
         info = load_state_into_model(model, checkpoint)
         if rank0():
             print(f"Resumed CPT checkpoint: {resume_path}")
@@ -980,7 +1041,7 @@ def load_resume_state(config: Dict[str, Any]) -> Dict[str, Any]:
             checkpoint_path = candidate
     if checkpoint_path is None:
         return {}
-    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     checkpoint["checkpoint_path"] = str(checkpoint_path)
     return checkpoint
 
@@ -1409,4 +1470,7 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    finally:
+        cleanup_distributed()
