@@ -9,6 +9,7 @@ import math
 import tiktoken
 import inspect
 import os
+from contextlib import nullcontext
 from dataclasses import dataclass
 from huggingface_hub import PyTorchModelHubMixin
 from typing import Optional
@@ -16,6 +17,23 @@ from typing import Optional
 from torch.distributed import init_process_group, destroy_process_group
 from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
+
+try:
+    from torch.nn.attention import SDPBackend, sdpa_kernel
+except ImportError:
+    SDPBackend = None
+    sdpa_kernel = None
+
+if sdpa_kernel is not None:
+    _SDPA_KERNEL_PARAMS = inspect.signature(sdpa_kernel).parameters
+    if "set_priority" in _SDPA_KERNEL_PARAMS:
+        _SDPA_KERNEL_PRIORITY_KWARG = "set_priority"
+    elif "set_priority_order" in _SDPA_KERNEL_PARAMS:
+        _SDPA_KERNEL_PRIORITY_KWARG = "set_priority_order"
+    else:
+        _SDPA_KERNEL_PRIORITY_KWARG = None
+else:
+    _SDPA_KERNEL_PRIORITY_KWARG = None
 
 
 @dataclass
@@ -45,6 +63,13 @@ class ModelConfig:
 
     ffn_dim_multiplier: Optional[int] = None    # optional multiplier to compute ffn_hidden_dims
 
+
+def sdpa_kernel_context(backends, set_priority=False):
+    if sdpa_kernel is None:
+        return nullcontext()
+    if set_priority and _SDPA_KERNEL_PRIORITY_KWARG is not None:
+        return sdpa_kernel(backends, **{_SDPA_KERNEL_PRIORITY_KWARG: True})
+    return sdpa_kernel(backends)
 
 
 # Helper function for RoPE
@@ -172,6 +197,35 @@ class GroupedQueryAttention(nn.Module):
         ).tril()
         return (same_doc & causal).unsqueeze(1)
 
+    def sdpa_attention(self, queries, keys, values, attention_mask):
+        enable_gqa = self.num_heads != self.num_kv_heads
+        is_causal = attention_mask is None
+        if (
+            SDPBackend is not None
+            and queries.is_cuda
+            and is_causal
+            and queries.dtype in {torch.float16, torch.bfloat16}
+        ):
+            backends = [SDPBackend.FLASH_ATTENTION, SDPBackend.MATH]
+            with sdpa_kernel_context(backends, set_priority=True):
+                return F.scaled_dot_product_attention(
+                    queries,
+                    keys,
+                    values,
+                    attn_mask=None,
+                    is_causal=True,
+                    enable_gqa=enable_gqa,
+                )
+
+        return F.scaled_dot_product_attention(
+            queries,
+            keys,
+            values,
+            attn_mask=attention_mask,
+            is_causal=is_causal,
+            enable_gqa=enable_gqa,
+        )
+
     def forward(self, x, cos, sin, start_pos = 0, positions=None):
         c_batch_size, c_context_len, c_dim = x.shape # c_context_len = 1
 
@@ -212,14 +266,7 @@ class GroupedQueryAttention(nn.Module):
         attention_mask = self.build_document_causal_mask(positions) if positions is not None else None
 
         if self.use_flash:
-            output = F.scaled_dot_product_attention(
-                queries,
-                keys,
-                v,
-                attn_mask=attention_mask,
-                is_causal=attention_mask is None,
-                enable_gqa=True,
-            )
+            output = self.sdpa_attention(queries, keys, v, attention_mask)
             
         else: # Calculate Grouped Query Attention manually
             keys = repeat_kv(keys, self.num_rep)
@@ -239,8 +286,13 @@ class GroupedQueryAttention(nn.Module):
 
             else: # Do not use kv_cache
                 if attention_mask is None:
-                    attention = torch.tril(attention[:, :, :c_context_len, :c_context_len])
-                    attention = attention.masked_fill(attention == 0, float("-inf"))
+                    causal = torch.ones(
+                        c_context_len,
+                        c_context_len,
+                        device=attention.device,
+                        dtype=torch.bool,
+                    ).tril()
+                    attention = attention.masked_fill(~causal, float("-inf"))
                 else:
                     attention = attention.masked_fill(~attention_mask, float("-inf"))
         
@@ -289,6 +341,10 @@ class FFNwMoE(nn.Module):
 
 
         self.router = nn.Linear(config.num_dims, self.num_experts, bias=False)
+        self.use_all_experts_fast_path = (
+            not self.use_lossfreebalance
+            and self.moe_active_experts == self.num_experts
+        )
         self.experts = nn.ModuleList()
         for _ in range(self.num_experts):
             self.experts.append(
@@ -314,7 +370,7 @@ class FFNwMoE(nn.Module):
             
     def forward(self, x: torch.Tensor):
         c_batch_size, c_context_len, c_dim = x.shape
-        x_flat = x.view(-1, c_dim)          #c_batch_size * c_context_len, c_dim
+        x_flat = x.reshape(-1, c_dim)          #c_batch_size * c_context_len, c_dim
 
         router_out = self.router(x_flat)
         router_probs = F.softmax(router_out, dim=-1) 
@@ -348,32 +404,39 @@ class FFNwMoE(nn.Module):
             aux_loss = (router_probs, topk_indices)
         return aux_loss, topk_probs
 
+    def _expert_forward(self, expert, x_flat):
+        w1, w2, w3 = expert
+        return w2(F.silu(w1(x_flat)) * w3(x_flat))
+
     def _compute_expert_outputs(self, x_flat, topk_indices, topk_probs, router_probs):
         """
         Compute the output of the experts and shared experts if needed
         """
         output = torch.zeros_like(x_flat)
 
+        if self.use_all_experts_fast_path:
+            for expert_id, expert in enumerate(self.experts):
+                output = output + self._expert_forward(expert, x_flat) * router_probs[:, expert_id:expert_id + 1]
+            for shared_expert in self.shared_experts:
+                output = output + self._expert_forward(shared_expert, x_flat)
+            return output
+
         for i in range(self.moe_active_experts):
             expert_index = topk_indices[:, i]
             expert_probs = topk_probs[:, i]
 
             for expert_id in range(self.num_experts):
-                idx = (expert_id == expert_index).nonzero().squeeze()
+                idx = (expert_id == expert_index).nonzero(as_tuple=True)[0]
 
                 if idx.numel() == 0:
                     continue
                 x_for_expert = x_flat[idx]
-                w1, w2, w3 = self.experts[expert_id]
-                
-                expert_output = w2(F.silu(w1(x_for_expert)) * w3(x_for_expert))
+                expert_output = self._expert_forward(self.experts[expert_id], x_for_expert)
                 output[idx] += expert_output * expert_probs[idx].unsqueeze(-1)
 
         # shared experts(for DeepSeekMoE)
-        for shared_expert_id in range(self.moe_shared_experts):
-            w1, w2, w3 = self.shared_experts[shared_expert_id]
-            expert_output = w2(F.silu(w1(x_flat)) * w3(x_flat))
-            output = output + expert_output
+        for shared_expert in self.shared_experts:
+            output = output + self._expert_forward(shared_expert, x_flat)
         
         return output
 
