@@ -9,6 +9,7 @@ import re
 import shutil
 import subprocess
 import time
+import warnings
 from collections import defaultdict
 from contextlib import nullcontext
 from datetime import datetime, timezone
@@ -231,6 +232,15 @@ def setup_distributed(config: Dict[str, Any]) -> Tuple[torch.device, int, int, i
 def cleanup_distributed() -> None:
     if is_dist():
         dist.destroy_process_group()
+
+
+def suppress_known_compile_warnings() -> None:
+    warnings.filterwarnings(
+        "ignore",
+        message=r"\s*Online softmax is disabled on the fly since Inductor decides to\s*split the reduction\..*",
+        category=UserWarning,
+        module=r"torch\._inductor\.lowering",
+    )
 
 
 def initialize_dist_run_id() -> None:
@@ -1735,6 +1745,8 @@ def main() -> None:
     args = parser.parse_args()
 
     config = read_json(Path(args.config))
+    if config["training"].get("compile", False):
+        suppress_known_compile_warnings()
     device, rank, _local_rank, world_size = setup_distributed(config)
     initialize_dist_run_id()
     set_seed(int(config["seed"]), rank)
