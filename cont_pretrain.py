@@ -905,7 +905,11 @@ def build_shard(
                 source_tokens += len(tokens)
                 source_docs += 1
                 tokens_written_total += len(tokens)
-                if source_docs == 1 or source_tokens // 10_000_000 != (source_tokens - len(tokens)) // 10_000_000:
+                progress_interval = int(config["tokens"].get("progress_log_tokens", 1_000_000))
+                if (
+                    source_docs == 1
+                    or source_tokens // progress_interval != (source_tokens - len(tokens)) // progress_interval
+                ):
                     log_rank0(
                         f"Source {source['id']} progress: "
                         f"{source_tokens:,}/{target:,} tokens, docs={source_docs:,}, "

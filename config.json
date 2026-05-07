@@ -35,11 +35,12 @@
   },
   "tokens": {
     "target_total_tokens": 40000000000,
-    "shard_target_tokens": null,
+    "shard_target_tokens": 200000000,
     "disk_budget_gb": 70,
     "disk_safety_fraction": 0.9,
     "avg_source_bytes_per_token": 4.0,
-    "max_tokens_per_ds_file": 250000000
+    "max_tokens_per_ds_file": 250000000,
+    "progress_log_tokens": 1000000
   },
   "special_tokens": {
     "additional_special_tokens": [
@@ -145,7 +146,7 @@
     "sources": [
       {
         "id": "stack_v2_python",
-        "enabled": true,
+        "enabled": false,
         "category": "python_code",
         "dataset": "bigcode/the-stack-v2-train-smol-ids",
         "split": "train",
