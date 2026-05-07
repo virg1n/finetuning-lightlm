@@ -21,7 +21,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
-from datasets import load_dataset
+from datasets import load_dataset, load_dataset_builder
 from datatrove.pipeline.tokens.tokenizer import TokenizedFile
 from datatrove.utils.dataset import DatatroveFolderDataset
 from huggingface_hub import hf_hub_download, list_repo_files
@@ -141,7 +141,32 @@ def has_aws_credentials() -> bool:
     )
 
 
-def validate_source_access(config: Dict[str, Any]) -> None:
+def hf_dataset_access_kwargs(source: Dict[str, Any], config: Dict[str, Any]) -> Dict[str, Any]:
+    kwargs: Dict[str, Any] = {}
+    if source.get("data_dir"):
+        kwargs["data_dir"] = source["data_dir"]
+    if source.get("data_files"):
+        kwargs["data_files"] = source["data_files"]
+    if source.get("trust_remote_code"):
+        kwargs["trust_remote_code"] = True
+    hf_token = get_hf_token(config, source)
+    if hf_token:
+        kwargs["token"] = hf_token
+    return kwargs
+
+
+def verify_hf_source_access(source: Dict[str, Any], config: Dict[str, Any]) -> None:
+    try:
+        load_dataset_builder(source["dataset"], **hf_dataset_access_kwargs(source, config))
+    except Exception as exc:
+        raise RuntimeError(
+            f"Source {source['id']} ({source['dataset']}) is not accessible with the current Hugging Face token. "
+            "Accept the dataset terms on Hugging Face for this account, run `huggingface-cli login` again "
+            "or `export HF_TOKEN=...`, or set this source to enabled=false in config.json."
+        ) from exc
+
+
+def validate_source_access(config: Dict[str, Any], verify_hf_access: bool = False) -> None:
     for source in enabled_sources(config):
         if source_requires_hf_access(source) and not get_hf_token(config, source):
             raise RuntimeError(
@@ -149,6 +174,8 @@ def validate_source_access(config: Dict[str, Any]) -> None:
                 "Run `huggingface-cli login` or `export HF_TOKEN=...`, accept the dataset terms on HF, "
                 "or set this source to enabled=false in config.json."
             )
+        if verify_hf_access and source_requires_hf_access(source):
+            verify_hf_source_access(source, config)
         if source.get("requires_swh_s3_access") and source.get("swh_unsigned") is False and not has_aws_credentials():
             raise RuntimeError(
                 f"Source {source['id']} is configured for signed SWH S3 access but no AWS credentials were found. "
@@ -1574,7 +1601,11 @@ def main() -> None:
     initialize_dist_run_id()
     set_seed(int(config["seed"]), rank)
     torch.set_float32_matmul_precision("high")
-    validate_source_access(config)
+    run_rank0_stage(
+        config,
+        "validate_source_access",
+        lambda: validate_source_access(config, verify_hf_access=True),
+    )
 
     tokenizer, model, _old_vocab_size = build_tokenizer_and_model(config, device)
     token_size = infer_token_size(len(tokenizer))
