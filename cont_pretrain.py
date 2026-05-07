@@ -25,6 +25,10 @@ from datasets import load_dataset
 from datatrove.pipeline.tokens.tokenizer import TokenizedFile
 from datatrove.utils.dataset import DatatroveFolderDataset
 from huggingface_hub import hf_hub_download, list_repo_files
+try:
+    from huggingface_hub import get_token as get_hf_hub_token
+except ImportError:
+    get_hf_hub_token = None
 from torch.nn.parallel import DistributedDataParallel as DDP
 from transformers import AutoTokenizer
 
@@ -65,6 +69,15 @@ STOPWORDS = {
     "how",
 }
 
+KNOWN_GATED_HF_DATASETS = {
+    "bigcode/starcoderdata",
+    "bigcode/the-stack-dedup",
+    "bigcode/the-stack-v2-train-smol-ids",
+}
+
+_DIST_RUN_ID = "single"
+_RANK0_STAGE_COUNTER = 0
+
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -95,15 +108,24 @@ def log_rank0(message: str) -> None:
         print(message, flush=True)
 
 
+def source_requires_hf_access(source: Dict[str, Any]) -> bool:
+    return bool(source.get("requires_hf_access")) or source.get("dataset") in KNOWN_GATED_HF_DATASETS
+
+
 def get_hf_token(config: Dict[str, Any], source: Optional[Dict[str, Any]] = None) -> Optional[str]:
     if source and source.get("hf_token"):
         return source["hf_token"]
-    return (
+    token = (
         config["data"].get("hf_token")
         or os.environ.get("HF_TOKEN")
         or os.environ.get("HUGGINGFACE_TOKEN")
         or os.environ.get("HUGGING_FACE_HUB_TOKEN")
     )
+    if token:
+        return token
+    if get_hf_hub_token is not None:
+        return get_hf_hub_token()
+    return None
 
 
 def has_aws_credentials() -> bool:
@@ -121,9 +143,9 @@ def has_aws_credentials() -> bool:
 
 def validate_source_access(config: Dict[str, Any]) -> None:
     for source in enabled_sources(config):
-        if source.get("requires_hf_access") and not get_hf_token(config, source):
+        if source_requires_hf_access(source) and not get_hf_token(config, source):
             raise RuntimeError(
-                f"Source {source['id']} requires a Hugging Face token and accepted dataset terms. "
+                f"Source {source['id']} ({source['dataset']}) requires a Hugging Face token and accepted dataset terms. "
                 "Run `huggingface-cli login` or `export HF_TOKEN=...`, accept the dataset terms on HF, "
                 "or set this source to enabled=false in config.json."
             )
@@ -144,17 +166,20 @@ def rank0() -> bool:
 
 def barrier() -> None:
     if is_dist():
-        dist.barrier()
+        if dist.get_backend() == "nccl" and torch.cuda.is_available():
+            dist.barrier(device_ids=[torch.cuda.current_device()])
+        else:
+            dist.barrier()
 
 
 def setup_distributed(config: Dict[str, Any]) -> Tuple[torch.device, int, int, int]:
     use_dist = config["training"].get("distributed", True) and "RANK" in os.environ
     if use_dist:
-        dist.init_process_group(backend="nccl")
         rank = int(os.environ["RANK"])
         local_rank = int(os.environ["LOCAL_RANK"])
         world_size = int(os.environ["WORLD_SIZE"])
         torch.cuda.set_device(local_rank)
+        dist.init_process_group(backend="nccl")
         device = torch.device(f"cuda:{local_rank}")
     else:
         rank = 0
@@ -167,6 +192,81 @@ def setup_distributed(config: Dict[str, Any]) -> Tuple[torch.device, int, int, i
 def cleanup_distributed() -> None:
     if is_dist():
         dist.destroy_process_group()
+
+
+def initialize_dist_run_id() -> None:
+    global _DIST_RUN_ID
+    if not is_dist():
+        _DIST_RUN_ID = "single"
+        return
+    value = f"{int(time.time())}_{os.getpid()}" if rank0() else None
+    values = [value]
+    device = None
+    if dist.get_backend() == "nccl" and torch.cuda.is_available():
+        device = torch.device("cuda", torch.cuda.current_device())
+    dist.broadcast_object_list(values, src=0, device=device)
+    _DIST_RUN_ID = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(values[0]))
+
+
+def rank0_stage_status_path(config: Dict[str, Any], name: str, counter: int) -> Path:
+    safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", name).strip("_")[:80] or "stage"
+    return (
+        Path(config["paths"]["output_dir"])
+        / ".dist_stages"
+        / _DIST_RUN_ID
+        / f"{counter:05d}_{safe_name}.json"
+    )
+
+
+def run_rank0_stage(config: Dict[str, Any], name: str, fn):
+    global _RANK0_STAGE_COUNTER
+    counter = _RANK0_STAGE_COUNTER
+    _RANK0_STAGE_COUNTER += 1
+    if not is_dist():
+        return fn()
+
+    status_path = rank0_stage_status_path(config, name, counter)
+    if rank0():
+        status_path.parent.mkdir(parents=True, exist_ok=True)
+        write_json(status_path, {"status": "running", "stage": name, "updated_at": utc_now()})
+        try:
+            result = fn()
+        except Exception as exc:
+            write_json(
+                status_path,
+                {
+                    "status": "error",
+                    "stage": name,
+                    "error_type": type(exc).__name__,
+                    "message": str(exc),
+                    "updated_at": utc_now(),
+                },
+            )
+            raise
+        write_json(status_path, {"status": "ok", "stage": name, "updated_at": utc_now()})
+        barrier()
+        return result
+
+    poll_seconds = float(config["training"].get("rank0_stage_poll_seconds", 5.0))
+    timeout_seconds = float(config["training"].get("rank0_stage_timeout_seconds", 0.0))
+    started = time.monotonic()
+    while True:
+        if status_path.exists():
+            try:
+                status = read_json(status_path)
+            except json.JSONDecodeError:
+                status = {"status": "running"}
+            if status.get("status") == "ok":
+                barrier()
+                return None
+            if status.get("status") == "error":
+                raise RuntimeError(
+                    f"Rank 0 failed during {name}: "
+                    f"{status.get('error_type', 'Error')}: {status.get('message', '')}"
+                )
+        if timeout_seconds > 0 and time.monotonic() - started > timeout_seconds:
+            raise TimeoutError(f"Timed out waiting for rank 0 stage {name}.")
+        time.sleep(max(poll_seconds, 0.1))
 
 
 def set_seed(seed: int, rank: int) -> None:
@@ -491,7 +591,17 @@ def load_hf_stream(source: Dict[str, Any], config: Dict[str, Any], seed: int, sk
     if hf_token:
         kwargs["token"] = hf_token
 
-    dataset = load_dataset(source["dataset"], **kwargs)
+    try:
+        dataset = load_dataset(source["dataset"], **kwargs)
+    except Exception as exc:
+        if source_requires_hf_access(source) or type(exc).__name__ == "DatasetNotFoundError":
+            raise RuntimeError(
+                f"Could not open source {source['id']} ({source['dataset']}). "
+                "If this is a gated dataset, accept the dataset terms on Hugging Face and "
+                "provide a token with `huggingface-cli login` or `export HF_TOKEN=...`; "
+                "otherwise disable this source in config.json."
+            ) from exc
+        raise
     shuffle_buffer = int(source.get("shuffle_buffer", config["data"].get("stream_shuffle_buffer", 0)))
     if shuffle_buffer > 0:
         log_rank0(f"Shuffling source {source['id']} with buffer_size={shuffle_buffer:,}")
@@ -1461,6 +1571,7 @@ def main() -> None:
 
     config = read_json(Path(args.config))
     device, rank, _local_rank, world_size = setup_distributed(config)
+    initialize_dist_run_id()
     set_seed(int(config["seed"]), rank)
     torch.set_float32_matmul_precision("high")
     validate_source_access(config)
@@ -1484,7 +1595,7 @@ def main() -> None:
     if resume_state.get("optimizer"):
         optimizer.load_state_dict(resume_state["optimizer"])
 
-    if rank0():
+    def startup_rank0_stage() -> None:
         output_dir = Path(config["paths"]["output_dir"])
         output_dir.mkdir(parents=True, exist_ok=True)
         tokenizer.save_pretrained(output_dir / "tokenizer")
@@ -1520,10 +1631,11 @@ def main() -> None:
             manifest["updated_at"] = utc_now()
             write_json(manifest_path, manifest)
             print("Initial BigCode eval completed or logged as skipped.")
-    barrier()
+
+    run_rank0_stage(config, "startup", startup_rank0_stage)
 
     while True:
-        if rank0():
+        def prepare_or_mark_shard_stage() -> None:
             manifest_path = Path(config["paths"]["manifest_path"])
             manifest = load_manifest(manifest_path)
             shard = next_shard_to_train(manifest)
@@ -1531,7 +1643,8 @@ def main() -> None:
                 shard = build_shard(config, manifest, len(manifest["shards"]), tokenizer, token_size)
             if shard is not None and not args.prepare_only:
                 mark_shard_status(config, int(shard["id"]), "training")
-        barrier()
+
+        run_rank0_stage(config, "prepare_or_mark_shard", prepare_or_mark_shard_stage)
 
         manifest = load_manifest(Path(config["paths"]["manifest_path"]))
         shard = next_shard_to_train(manifest)
@@ -1555,13 +1668,14 @@ def main() -> None:
         resume_state = {}
         barrier()
 
-        if rank0():
+        def finish_shard_stage() -> None:
             manifest = load_manifest(Path(config["paths"]["manifest_path"]))
             mark_shard_status(config, int(shard["id"]), "trained", trained_at=utc_now())
             if config["training"].get("delete_shard_after_train", True):
                 safe_delete_shard(Path(shard["path"]), Path(config["paths"]["shard_root"]))
                 mark_shard_status(config, int(shard["id"]), "deleted", deleted_at=utc_now())
-        barrier()
+
+        run_rank0_stage(config, f"finish_shard_{int(shard['id'])}", finish_shard_stage)
 
     cleanup_distributed()
 

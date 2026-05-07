@@ -171,7 +171,8 @@
         "weight": 1.0,
         "text_field": "content",
         "path_field": "max_stars_repo_path",
-        "languages": ["Python"]
+        "languages": ["Python"],
+        "requires_hf_access": true
       },
       {
         "id": "codeparrot_clean",
@@ -208,7 +209,8 @@
         "weight": 1.0,
         "text_field": "content",
         "path_field": "max_stars_repo_path",
-        "languages": ["JavaScript"]
+        "languages": ["JavaScript"],
+        "requires_hf_access": true
       },
       {
         "id": "starcoder_c",
@@ -220,7 +222,8 @@
         "weight": 1.0,
         "text_field": "content",
         "path_field": "max_stars_repo_path",
-        "languages": ["C"]
+        "languages": ["C"],
+        "requires_hf_access": true
       },
       {
         "id": "starcoder_rust",
@@ -232,7 +235,8 @@
         "weight": 1.0,
         "text_field": "content",
         "path_field": "max_stars_repo_path",
-        "languages": ["Rust"]
+        "languages": ["Rust"],
+        "requires_hf_access": true
       },
       {
         "id": "starcoder_go",
@@ -244,7 +248,8 @@
         "weight": 1.0,
         "text_field": "content",
         "path_field": "max_stars_repo_path",
-        "languages": ["Go"]
+        "languages": ["Go"],
+        "requires_hf_access": true
       },
       {
         "id": "github_issues",
@@ -255,7 +260,8 @@
         "split": "train",
         "weight": 2.0,
         "text_field": ["title", "body", "comments"],
-        "english_only": true
+        "english_only": true,
+        "requires_hf_access": true
       },
       {
         "id": "arxiv_cs_abstracts",
