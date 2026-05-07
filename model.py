@@ -454,6 +454,7 @@ class Transformer(nn.Module, PyTorchModelHubMixin): # extending PyTorchModelHubM
         targets: Optional[torch.Tensor] = None,
         start_pos: int = 0,
         positions: Optional[torch.Tensor] = None,
+        return_hidden: bool = False,
     ):
         _, seq_len = x.shape
         
@@ -472,6 +473,9 @@ class Transformer(nn.Module, PyTorchModelHubMixin): # extending PyTorchModelHubM
                 total_aux_loss += aux_loss
         
         x = self.norm(x)
+        if return_hidden:
+            return x, None, None
+
         logits = self.ll_head(x)
         
         

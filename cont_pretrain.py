@@ -30,6 +30,7 @@ try:
 except ImportError:
     get_hf_hub_token = None
 from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.checkpoint import checkpoint as checkpoint_fn
 from transformers import AutoTokenizer
 
 from model import ModelConfig, Transformer
@@ -1257,7 +1258,65 @@ def compute_loss_by_mode(
     modes: torch.Tensor,
     positions: Optional[torch.Tensor] = None,
     loss_mask: Optional[torch.Tensor] = None,
+    loss_chunk_tokens: int = 0,
 ) -> Tuple[torch.Tensor, Dict[str, Tuple[float, int]]]:
+    if loss_chunk_tokens > 0 and loss_chunk_tokens < y.shape[1]:
+        hidden, _, _ = model(x, targets=None, positions=positions, return_hidden=True)
+        head = getattr(model, "module", model).ll_head
+        batch_size, seq_len = y.shape
+        sample_loss_sums = torch.zeros(batch_size, device=y.device, dtype=torch.float32)
+
+        for start in range(0, seq_len, loss_chunk_tokens):
+            end = min(start + loss_chunk_tokens, seq_len)
+            hidden_chunk = hidden[:, start:end, :]
+            target_chunk = y[:, start:end]
+            mask_chunk = loss_mask[:, start:end] if loss_mask is not None else None
+            chunk_len = end - start
+
+            def chunk_loss_sums(
+                chunk_hidden: torch.Tensor,
+                target_chunk: torch.Tensor = target_chunk,
+                mask_chunk: Optional[torch.Tensor] = mask_chunk,
+                chunk_len: int = chunk_len,
+            ) -> torch.Tensor:
+                logits = head(chunk_hidden)
+                vocab = logits.shape[-1]
+                losses = F.cross_entropy(
+                    logits.reshape(-1, vocab),
+                    target_chunk.reshape(-1),
+                    reduction="none",
+                ).view(batch_size, chunk_len)
+                if mask_chunk is not None:
+                    losses = losses * mask_chunk.to(losses.dtype)
+                return losses.float().sum(dim=1)
+
+            sample_loss_sums = sample_loss_sums + checkpoint_fn(
+                chunk_loss_sums,
+                hidden_chunk,
+                use_reentrant=False,
+            )
+
+        if loss_mask is not None:
+            valid_tokens = loss_mask.sum(dim=1).clamp_min(1).to(sample_loss_sums.dtype)
+        else:
+            valid_tokens = torch.full(
+                (batch_size,),
+                seq_len,
+                device=y.device,
+                dtype=sample_loss_sums.dtype,
+            )
+        sample_loss = sample_loss_sums / valid_tokens
+        loss = sample_loss.mean()
+        metrics: Dict[str, Tuple[float, int]] = {}
+        for mode_id, mode_name in MODE_NAMES.items():
+            mask = modes == mode_id
+            count = int(mask.sum().item())
+            if count:
+                metrics[mode_name] = (float(sample_loss[mask].sum().detach().item()), count)
+            else:
+                metrics[mode_name] = (0.0, 0)
+        return loss, metrics
+
     logits, _, _ = model(x, targets=None, positions=positions)
     vocab = logits.shape[-1]
     token_loss = F.cross_entropy(logits.reshape(-1, vocab), y.reshape(-1), reduction="none").view(y.shape)
@@ -1541,6 +1600,7 @@ def train_shard(
     dtype = get_dtype(tcfg["dtype"])
     use_amp = device.type == "cuda"
     grad_accum = int(tcfg["gradient_accumulation_steps"])
+    loss_chunk_tokens = int(tcfg.get("loss_chunk_tokens", 0))
     checkpoint_interval = int(tcfg["checkpoint_interval_steps"])
     log_interval = int(tcfg["log_interval_steps"])
     train_log = Path(config["paths"]["train_log_file"])
@@ -1574,7 +1634,15 @@ def train_shard(
             amp_context = torch.autocast(device_type=device.type, dtype=dtype) if use_amp else nullcontext()
             with sync_context:
                 with amp_context:
-                    loss, metrics = compute_loss_by_mode(model, x, y, modes, positions, loss_mask)
+                    loss, metrics = compute_loss_by_mode(
+                        model,
+                        x,
+                        y,
+                        modes,
+                        positions,
+                        loss_mask,
+                        loss_chunk_tokens=loss_chunk_tokens,
+                    )
                     (loss / grad_accum).backward()
             for mode, (loss_sum, count) in metrics.items():
                 prev_sum, prev_count = step_metrics[mode]
