@@ -143,6 +143,9 @@ def has_aws_credentials() -> bool:
 
 def hf_dataset_access_kwargs(source: Dict[str, Any], config: Dict[str, Any]) -> Dict[str, Any]:
     kwargs: Dict[str, Any] = {}
+    config_name = source.get("config_name") or source.get("name")
+    if config_name:
+        kwargs["name"] = config_name
     if source.get("data_dir"):
         kwargs["data_dir"] = source["data_dir"]
     if source.get("data_files"):
@@ -159,10 +162,18 @@ def verify_hf_source_access(source: Dict[str, Any], config: Dict[str, Any]) -> N
     try:
         load_dataset_builder(source["dataset"], **hf_dataset_access_kwargs(source, config))
     except Exception as exc:
+        if source_requires_hf_access(source):
+            hint = (
+                "Accept the dataset terms on Hugging Face for this account, run `huggingface-cli login` again "
+                "or `export HF_TOKEN=...`, or set this source to enabled=false in config.json."
+            )
+        else:
+            hint = (
+                "Check the dataset name, config_name, data_dir, data_files, and split in config.json, "
+                "or set this source to enabled=false."
+            )
         raise RuntimeError(
-            f"Source {source['id']} ({source['dataset']}) is not accessible with the current Hugging Face token. "
-            "Accept the dataset terms on Hugging Face for this account, run `huggingface-cli login` again "
-            "or `export HF_TOKEN=...`, or set this source to enabled=false in config.json."
+            f"Source {source['id']} ({source['dataset']}) could not be opened. {hint}"
         ) from exc
 
 
@@ -174,7 +185,7 @@ def validate_source_access(config: Dict[str, Any], verify_hf_access: bool = Fals
                 "Run `huggingface-cli login` or `export HF_TOKEN=...`, accept the dataset terms on HF, "
                 "or set this source to enabled=false in config.json."
             )
-        if verify_hf_access and source_requires_hf_access(source):
+        if verify_hf_access:
             verify_hf_source_access(source, config)
         if source.get("requires_swh_s3_access") and source.get("swh_unsigned") is False and not has_aws_credentials():
             raise RuntimeError(
@@ -600,23 +611,17 @@ def source_targets(config: Dict[str, Any], shard_tokens: int) -> Dict[str, int]:
 
 
 def load_hf_stream(source: Dict[str, Any], config: Dict[str, Any], seed: int, skip: int):
+    config_name = source.get("config_name") or source.get("name")
+    config_text = f" config={config_name}" if config_name else ""
     log_rank0(
         f"Opening source {source['id']} "
-        f"dataset={source['dataset']} split={source.get('split', 'train')} skip={skip:,}"
+        f"dataset={source['dataset']}{config_text} split={source.get('split', 'train')} skip={skip:,}"
     )
     kwargs = {
         "split": source.get("split", "train"),
         "streaming": True,
     }
-    if source.get("data_dir"):
-        kwargs["data_dir"] = source["data_dir"]
-    if source.get("data_files"):
-        kwargs["data_files"] = source["data_files"]
-    if source.get("trust_remote_code"):
-        kwargs["trust_remote_code"] = True
-    hf_token = get_hf_token(config, source)
-    if hf_token:
-        kwargs["token"] = hf_token
+    kwargs.update(hf_dataset_access_kwargs(source, config))
 
     try:
         dataset = load_dataset(source["dataset"], **kwargs)
@@ -628,7 +633,11 @@ def load_hf_stream(source: Dict[str, Any], config: Dict[str, Any], seed: int, sk
                 "provide a token with `huggingface-cli login` or `export HF_TOKEN=...`; "
                 "otherwise disable this source in config.json."
             ) from exc
-        raise
+        raise RuntimeError(
+            f"Could not open source {source['id']} ({source['dataset']}). "
+            "Check dataset config_name, data_dir, data_files, and split in config.json, "
+            "or disable this source."
+        ) from exc
     shuffle_buffer = int(source.get("shuffle_buffer", config["data"].get("stream_shuffle_buffer", 0)))
     if shuffle_buffer > 0:
         log_rank0(f"Shuffling source {source['id']} with buffer_size={shuffle_buffer:,}")

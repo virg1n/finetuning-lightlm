@@ -300,6 +300,7 @@
         "enabled": true,
         "category": "english_replay",
         "dataset": "HuggingFaceTB/cosmopedia",
+        "config_name": "web_samples_v2",
         "split": "train",
         "weight": 1.0,
         "text_field": "text",
