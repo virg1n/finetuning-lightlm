@@ -92,8 +92,10 @@ class LightLMForCausalLM(PreTrainedModel, GenerationMixin):
         self.all_tied_weights_keys = {key: key for key in self._tied_weights_keys}
         self.tie_weights()
 
-    def tie_weights(self):
+    def tie_weights(self, *args, **kwargs):
+        del args, kwargs
         self.lightlm.ll_head.weight = self.lightlm.tokens_embedding.weight
+        self.all_tied_weights_keys = {key: key for key in self._tied_weights_keys}
 
     def get_input_embeddings(self):
         return self.lightlm.tokens_embedding
