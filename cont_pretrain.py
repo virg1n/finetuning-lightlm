@@ -1199,6 +1199,14 @@ class PackedShardBatcher:
         self.current = self.start + start_microbatch * self.batch_size
         self.microbatches = max((self.end - self.start) // self.batch_size, 0)
 
+    def current_mode(self) -> int:
+        current_file = self.dataset.files[self.dataset.current_file]
+        for attr in ("read_path", "file_path", "path"):
+            file_path = getattr(current_file, attr, None)
+            if file_path:
+                return mode_from_path(str(file_path))
+        return MODES["standard"]
+
     def next_batch(
         self,
     ) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]]:
@@ -1212,7 +1220,7 @@ class PackedShardBatcher:
             rows.append(item["input_ids"])
             if "positions" in item:
                 positions.append(item["positions"])
-            modes.append(mode_from_path(self.dataset.current_file_path))
+            modes.append(self.current_mode())
         self.current += self.batch_size
         batch = torch.stack(rows)
         if positions:
