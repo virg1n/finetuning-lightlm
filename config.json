@@ -155,7 +155,10 @@
         "path_field": "path",
         "text_field": "content",
         "requires_hf_access": true,
-        "requires_swh_s3_access": true
+        "requires_swh_s3_access": true,
+        "swh_transport": "https",
+        "swh_unsigned": true,
+        "swh_timeout_seconds": 60
       },
       {
         "id": "starcoder_python",

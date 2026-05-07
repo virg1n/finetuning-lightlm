@@ -1,4 +1,5 @@
 import argparse
+import gzip
 import html
 import json
 import math
@@ -14,6 +15,7 @@ from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
 from urllib.parse import unquote
+from urllib.request import urlopen
 
 import numpy as np
 import torch
@@ -125,11 +127,10 @@ def validate_source_access(config: Dict[str, Any]) -> None:
                 "Run `huggingface-cli login` or `export HF_TOKEN=...`, accept the dataset terms on HF, "
                 "or set this source to enabled=false in config.json."
             )
-        if source.get("requires_swh_s3_access") and not source.get("swh_unsigned", False) and not has_aws_credentials():
+        if source.get("requires_swh_s3_access") and source.get("swh_unsigned") is False and not has_aws_credentials():
             raise RuntimeError(
-                f"Source {source['id']} requires Software Heritage S3/AWS credentials for file contents. "
-                "Set AWS credentials after obtaining access, set swh_unsigned=true if your environment can read it "
-                "anonymously, or disable this source in config.json."
+                f"Source {source['id']} is configured for signed SWH S3 access but no AWS credentials were found. "
+                "Set AWS credentials, set swh_unsigned=true, set swh_transport=https, or disable this source."
             )
 
 
@@ -501,20 +502,32 @@ def load_hf_stream(source: Dict[str, Any], config: Dict[str, Any], seed: int, sk
 
 
 class SWHContentClient:
-    def __init__(self, unsigned: bool = False):
-        import boto3
-        from smart_open import open as smart_open
+    def __init__(self, transport: str = "https", unsigned: bool = True, timeout: int = 60):
+        self.transport = transport
+        self.timeout = timeout
+        self.smart_open = None
+        self.client = None
 
-        self.smart_open = smart_open
-        if unsigned:
-            from botocore import UNSIGNED
-            from botocore.config import Config
+        if transport == "s3":
+            import boto3
+            from smart_open import open as smart_open
 
-            self.client = boto3.client("s3", config=Config(signature_version=UNSIGNED))
-        else:
-            self.client = boto3.Session().client("s3")
+            self.smart_open = smart_open
+            if unsigned:
+                from botocore import UNSIGNED
+                from botocore.config import Config
+
+                self.client = boto3.client("s3", config=Config(signature_version=UNSIGNED))
+            else:
+                self.client = boto3.Session().client("s3")
 
     def read_text(self, blob_id: str, encoding: str = "utf-8") -> str:
+        if self.transport == "https":
+            url = f"https://softwareheritage.s3.amazonaws.com/content/{blob_id}"
+            with urlopen(url, timeout=self.timeout) as response:
+                raw = response.read()
+            return gzip.decompress(raw).decode(encoding or "utf-8", errors="replace")
+
         url = f"s3://softwareheritage/content/{blob_id}"
         with self.smart_open(url, "rb", compression=".gz", transport_params={"client": self.client}) as f:
             return f.read().decode(encoding or "utf-8", errors="replace")
@@ -861,8 +874,16 @@ def build_shard(
         stream = load_hf_stream(source, config, int(config["seed"]) + shard_id, skip)
         swh_client = None
         if source.get("content_loader") == "stack_v2_swh":
-            log_rank0(f"Source {source['id']} uses SWH S3 content fetches; first rows can be slow.")
-            swh_client = SWHContentClient(unsigned=bool(source.get("swh_unsigned", False)))
+            swh_transport = source.get("swh_transport", "https")
+            log_rank0(
+                f"Source {source['id']} uses SWH content fetches via {swh_transport}; "
+                "first rows can be slow."
+            )
+            swh_client = SWHContentClient(
+                transport=swh_transport,
+                unsigned=bool(source.get("swh_unsigned", True)),
+                timeout=int(source.get("swh_timeout_seconds", 60)),
+            )
 
         source_tokens = 0
         source_docs = 0
