@@ -1,0 +1,298 @@
+{
+  "run_name": "lightlm-python-cpt",
+  "seed": 1338,
+  "paths": {
+    "output_dir": "cpt_runs/lightlm-python-cpt",
+    "shard_root": "datasets/cpt_shards",
+    "manifest_path": "cpt_runs/lightlm-python-cpt/manifest.json",
+    "train_log_file": "cpt_runs/lightlm-python-cpt/logs/train.jsonl",
+    "eval_log_file": "cpt_runs/lightlm-python-cpt/logs/eval.jsonl",
+    "checkpoint_dir": "cpt_runs/lightlm-python-cpt/checkpoints"
+  },
+  "model": {
+    "base_checkpoint": "Virg1n/LightLM",
+    "tokenizer_name": "HuggingFaceTB/SmolLM-360M",
+    "resume_checkpoint": "latest",
+    "variant": "ffn",
+    "num_dims": 512,
+    "num_heads": 16,
+    "num_kv_heads": 4,
+    "num_layers": 32,
+    "ffn_hidden_dims": 2048,
+    "rmsnorm_eps": 1e-6,
+    "rope_theta": 100000.0,
+    "context_len": 2048,
+    "use_cache": false,
+    "use_flash": true,
+    "use_moe": false,
+    "moe_num_experts": 2,
+    "moe_active_experts": 2,
+    "moe_eps": 1e-6,
+    "moe_aux_loss_coef": 0.01,
+    "moe_shared_experts": 1,
+    "use_lossfreebalance": false
+  },
+  "tokens": {
+    "target_total_tokens": 40000000000,
+    "shard_target_tokens": null,
+    "disk_budget_gb": 70,
+    "disk_safety_fraction": 0.9,
+    "avg_source_bytes_per_token": 4.0,
+    "max_tokens_per_ds_file": 250000000
+  },
+  "special_tokens": {
+    "additional_special_tokens": [
+      "<fim_prefix>",
+      "<fim_middle>",
+      "<fim_suffix>",
+      "<fim_pad>",
+      "<filename>"
+    ],
+    "fim_prefix": "<fim_prefix>",
+    "fim_middle": "<fim_middle>",
+    "fim_suffix": "<fim_suffix>",
+    "fim_pad": "<fim_pad>",
+    "filename": "<filename>",
+    "init_seed_words": {
+      "<fim_prefix>": ["prefix", "begin", "before", "context"],
+      "<fim_middle>": ["middle", "insert", "fill", "code"],
+      "<fim_suffix>": ["suffix", "end", "after", "context"],
+      "<fim_pad>": ["pad", "padding", "blank"],
+      "<filename>": ["filename", "file", "path", "module"]
+    }
+  },
+  "fim": {
+    "enabled": true,
+    "max_probability": 0.6,
+    "start_probability": 0.1,
+    "ramp_tokens": 13000000000,
+    "psm_fraction": 0.5,
+    "min_chars": 32,
+    "min_tokens": 8,
+    "apply_to_categories": ["python_code", "other_code"],
+    "prepend_filename_probability": 0.5
+  },
+  "training": {
+    "distributed": true,
+    "dtype": "bfloat16",
+    "compile": false,
+    "max_seq_len": 2048,
+    "per_device_batch_size": 16,
+    "gradient_accumulation_steps": 8,
+    "expected_gpus": 4,
+    "effective_tokens_per_step": 1048576,
+    "isolate_documents": true,
+    "learning_rate": 0.0001,
+    "min_learning_rate": 0.00001,
+    "warmup_start_learning_rate": 0.00001,
+    "warmup_ratio": 0.015,
+    "weight_decay": 0.1,
+    "betas": [0.9, 0.95],
+    "grad_clip": 1.0,
+    "checkpoint_interval_steps": 1000,
+    "log_interval_steps": 10,
+    "delete_shard_after_train": true
+  },
+  "evaluation": {
+    "bigcode_harness": {
+      "enabled": true,
+      "interval_tokens": 2000000000,
+      "command": [
+        "accelerate",
+        "launch",
+        "main.py",
+        "--model",
+        "{eval_model}",
+        "--trust_remote_code",
+        "--precision",
+        "bf16",
+        "--tasks",
+        "humaneval,mbpp",
+        "--max_length_generation",
+        "512",
+        "--temperature",
+        "0.2",
+        "--n_samples",
+        "1",
+        "--batch_size",
+        "16",
+        "--allow_code_execution",
+        "--save_generations",
+        "--save_generations_path",
+        "{output_dir}/eval_generations_step_{step}.json"
+      ],
+      "cwd": "../bigcode-evaluation-harness",
+      "eval_model": "{output_dir}"
+    }
+  },
+  "data": {
+    "hf_token": null,
+    "stream_shuffle_buffer": 10000,
+    "min_doc_chars": 32,
+    "english_filter": {
+      "enabled": true,
+      "min_ascii_ratio": 0.85,
+      "min_stopword_hits": 2
+    },
+    "mix": {
+      "python_code": 0.75,
+      "other_code": 0.05,
+      "technical_english": 0.15,
+      "english_replay": 0.05
+    },
+    "sources": [
+      {
+        "id": "stack_v2_python",
+        "enabled": true,
+        "category": "python_code",
+        "dataset": "bigcode/the-stack-v2-train-smol-ids",
+        "split": "train",
+        "weight": 1.0,
+        "content_loader": "stack_v2_swh",
+        "languages": ["Python"],
+        "path_field": "path",
+        "text_field": "content",
+        "requires_hf_access": true,
+        "requires_swh_s3_access": true
+      },
+      {
+        "id": "starcoder_python",
+        "enabled": true,
+        "category": "python_code",
+        "dataset": "bigcode/starcoderdata",
+        "data_dir": "python",
+        "split": "train",
+        "weight": 1.0,
+        "text_field": "content",
+        "path_field": "max_stars_repo_path",
+        "languages": ["Python"]
+      },
+      {
+        "id": "codeparrot_clean",
+        "enabled": true,
+        "category": "python_code",
+        "dataset": "codeparrot/codeparrot-clean",
+        "split": "train",
+        "weight": 1.0,
+        "text_field": "content",
+        "path_field": "path",
+        "languages": ["Python"]
+      },
+      {
+        "id": "the_stack_jupyter_notebooks",
+        "enabled": true,
+        "category": "python_code",
+        "dataset": "bigcode/the-stack-dedup",
+        "data_dir": "data/jupyter-notebook",
+        "split": "train",
+        "weight": 0.5,
+        "text_field": "content",
+        "path_field": "max_stars_repo_path",
+        "languages": ["Jupyter Notebook"],
+        "content_processor": "python_notebook_code_cells",
+        "requires_hf_access": true
+      },
+      {
+        "id": "starcoder_javascript",
+        "enabled": true,
+        "category": "other_code",
+        "dataset": "bigcode/starcoderdata",
+        "data_dir": "javascript",
+        "split": "train",
+        "weight": 1.0,
+        "text_field": "content",
+        "path_field": "max_stars_repo_path",
+        "languages": ["JavaScript"]
+      },
+      {
+        "id": "starcoder_c",
+        "enabled": true,
+        "category": "other_code",
+        "dataset": "bigcode/starcoderdata",
+        "data_dir": "c",
+        "split": "train",
+        "weight": 1.0,
+        "text_field": "content",
+        "path_field": "max_stars_repo_path",
+        "languages": ["C"]
+      },
+      {
+        "id": "starcoder_rust",
+        "enabled": true,
+        "category": "other_code",
+        "dataset": "bigcode/starcoderdata",
+        "data_dir": "rust",
+        "split": "train",
+        "weight": 1.0,
+        "text_field": "content",
+        "path_field": "max_stars_repo_path",
+        "languages": ["Rust"]
+      },
+      {
+        "id": "starcoder_go",
+        "enabled": true,
+        "category": "other_code",
+        "dataset": "bigcode/starcoderdata",
+        "data_dir": "go",
+        "split": "train",
+        "weight": 1.0,
+        "text_field": "content",
+        "path_field": "max_stars_repo_path",
+        "languages": ["Go"]
+      },
+      {
+        "id": "github_issues",
+        "enabled": true,
+        "category": "technical_english",
+        "dataset": "bigcode/starcoderdata",
+        "data_dir": "github-issues-filtered-structured",
+        "split": "train",
+        "weight": 2.0,
+        "text_field": ["title", "body", "comments"],
+        "english_only": true
+      },
+      {
+        "id": "arxiv_cs_abstracts",
+        "enabled": true,
+        "category": "technical_english",
+        "dataset": "CCRss/arxiv_papers_cs",
+        "split": "train",
+        "weight": 1.0,
+        "text_field": ["title", "abstract"],
+        "english_only": true
+      },
+      {
+        "id": "stackexchange_stackoverflow",
+        "enabled": true,
+        "category": "technical_english",
+        "dataset": "HuggingFaceH4/stack-exchange-preferences",
+        "data_dir": "data/Stackoverflow.com",
+        "split": "train",
+        "weight": 2.0,
+        "text_field": "question",
+        "content_processor": "stackexchange_preference_qa",
+        "english_only": true
+      },
+      {
+        "id": "github_issue_pr_sample",
+        "enabled": true,
+        "category": "technical_english",
+        "dataset": "linqus/github-issues",
+        "split": "train",
+        "weight": 1.0,
+        "text_field": ["title", "body", "comments"],
+        "english_only": true
+      },
+      {
+        "id": "cosmopedia_replay",
+        "enabled": true,
+        "category": "english_replay",
+        "dataset": "HuggingFaceTB/cosmopedia",
+        "split": "train",
+        "weight": 1.0,
+        "text_field": "text",
+        "english_only": true
+      }
+    ]
+  }
+}

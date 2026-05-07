@@ -1,0 +1,127 @@
+from typing import Optional
+
+import torch
+import torch.nn.functional as F
+from transformers import PretrainedConfig, PreTrainedModel
+from transformers.generation import GenerationMixin
+from transformers.modeling_outputs import CausalLMOutputWithPast
+
+try:
+    from .model import ModelConfig, Transformer
+except ImportError:
+    from model import ModelConfig, Transformer
+
+
+class LightLMConfig(PretrainedConfig):
+    model_type = "lightlm"
+
+    def __init__(
+        self,
+        vocab_size=49152,
+        num_dims=512,
+        num_heads=16,
+        num_kv_heads=4,
+        num_layers=32,
+        ffn_hidden_dims=2048,
+        rmsnorm_eps=1e-6,
+        rope_theta=100000.0,
+        context_len=2048,
+        use_cache=False,
+        use_flash=True,
+        use_moe=False,
+        moe_num_experts=2,
+        moe_active_experts=2,
+        moe_eps=1e-6,
+        moe_aux_loss_coef=0.01,
+        moe_shared_experts=1,
+        use_lossfreebalance=False,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        self.vocab_size = vocab_size
+        self.num_dims = num_dims
+        self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads
+        self.num_layers = num_layers
+        self.ffn_hidden_dims = ffn_hidden_dims
+        self.rmsnorm_eps = rmsnorm_eps
+        self.rope_theta = rope_theta
+        self.context_len = context_len
+        self.use_cache = use_cache
+        self.use_flash = use_flash
+        self.use_moe = use_moe
+        self.moe_num_experts = moe_num_experts
+        self.moe_active_experts = moe_active_experts
+        self.moe_eps = moe_eps
+        self.moe_aux_loss_coef = moe_aux_loss_coef
+        self.moe_shared_experts = moe_shared_experts
+        self.use_lossfreebalance = use_lossfreebalance
+
+    def to_model_config(self) -> ModelConfig:
+        return ModelConfig(
+            vocab_size=self.vocab_size,
+            num_dims=self.num_dims,
+            num_heads=self.num_heads,
+            num_kv_heads=self.num_kv_heads,
+            num_layers=self.num_layers,
+            ffn_hidden_dims=self.ffn_hidden_dims,
+            rmsnorm_eps=self.rmsnorm_eps,
+            rope_theta=self.rope_theta,
+            context_len=self.context_len,
+            use_cache=False,
+            use_flash=self.use_flash,
+            use_moe=self.use_moe,
+            moe_num_experts=self.moe_num_experts,
+            moe_active_experts=self.moe_active_experts,
+            moe_eps=self.moe_eps,
+            moe_aux_loss_coef=self.moe_aux_loss_coef,
+            moe_shared_experts=self.moe_shared_experts,
+            use_lossfreebalance=self.use_lossfreebalance,
+        )
+
+
+class LightLMForCausalLM(PreTrainedModel, GenerationMixin):
+    config_class = LightLMConfig
+    base_model_prefix = "lightlm"
+    supports_gradient_checkpointing = False
+
+    def __init__(self, config: LightLMConfig):
+        super().__init__(config)
+        self.lightlm = Transformer(config.to_model_config())
+
+    def get_input_embeddings(self):
+        return self.lightlm.tokens_embedding
+
+    def set_input_embeddings(self, value):
+        self.lightlm.tokens_embedding = value
+        self.lightlm.ll_head.weight = value.weight
+
+    def get_output_embeddings(self):
+        return self.lightlm.ll_head
+
+    def set_output_embeddings(self, new_embeddings):
+        self.lightlm.ll_head = new_embeddings
+        self.lightlm.tokens_embedding.weight = new_embeddings.weight
+
+    def prepare_inputs_for_generation(self, input_ids, **kwargs):
+        return {"input_ids": input_ids}
+
+    def forward(
+        self,
+        input_ids: Optional[torch.LongTensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        labels: Optional[torch.LongTensor] = None,
+        **kwargs,
+    ):
+        del attention_mask, kwargs
+        logits, _, _ = self.lightlm(input_ids, targets=None)
+        loss = None
+        if labels is not None:
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+            loss = F.cross_entropy(
+                shift_logits.view(-1, shift_logits.size(-1)),
+                shift_labels.view(-1),
+                ignore_index=-100,
+            )
+        return CausalLMOutputWithPast(loss=loss, logits=logits)

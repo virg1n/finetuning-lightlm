@@ -1,0 +1,17 @@
+torch>=2.2
+transformers>=4.50
+tokenizers
+datasets
+huggingface_hub
+safetensors
+datatrove
+numpy
+tqdm
+humanize
+fsspec
+smart_open[s3]
+boto3
+botocore
+accelerate
+evaluate
+sentencepiece
