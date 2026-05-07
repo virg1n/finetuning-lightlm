@@ -88,6 +88,11 @@ def append_jsonl(path: Path, row: Dict[str, Any]) -> None:
         f.write(json.dumps(row, sort_keys=True) + "\n")
 
 
+def log_rank0(message: str) -> None:
+    if rank0():
+        print(message, flush=True)
+
+
 def is_dist() -> bool:
     return dist.is_available() and dist.is_initialized()
 
@@ -427,6 +432,10 @@ def source_targets(config: Dict[str, Any], shard_tokens: int) -> Dict[str, int]:
 
 
 def load_hf_stream(source: Dict[str, Any], config: Dict[str, Any], seed: int, skip: int):
+    log_rank0(
+        f"Opening source {source['id']} "
+        f"dataset={source['dataset']} split={source.get('split', 'train')} skip={skip:,}"
+    )
     kwargs = {
         "split": source.get("split", "train"),
         "streaming": True,
@@ -444,6 +453,7 @@ def load_hf_stream(source: Dict[str, Any], config: Dict[str, Any], seed: int, sk
     dataset = load_dataset(source["dataset"], **kwargs)
     shuffle_buffer = int(source.get("shuffle_buffer", config["data"].get("stream_shuffle_buffer", 0)))
     if shuffle_buffer > 0:
+        log_rank0(f"Shuffling source {source['id']} with buffer_size={shuffle_buffer:,}")
         dataset = dataset.shuffle(buffer_size=shuffle_buffer, seed=seed)
     if skip > 0:
         dataset = dataset.skip(skip)
@@ -797,15 +807,21 @@ def build_shard(
     source_stats: Dict[str, Any] = {}
     tokens_written_total = 0
     shard_start_tokens = int(manifest.get("tokens_prepared", 0))
+    log_rank0(
+        f"Building shard {shard_id} at {shard_dir} "
+        f"target={shard_target:,} tokens start={shard_start_tokens:,}"
+    )
 
     for source in enabled_sources(config):
         target = int(targets.get(source["id"], 0))
         if target <= 0:
             continue
         skip = int(source_offsets.get(source["id"], 0))
+        log_rank0(f"Source {source['id']} target={target:,} tokens")
         stream = load_hf_stream(source, config, int(config["seed"]) + shard_id, skip)
         swh_client = None
         if source.get("content_loader") == "stack_v2_swh":
+            log_rank0(f"Source {source['id']} uses SWH S3 content fetches; first rows can be slow.")
             swh_client = SWHContentClient(unsigned=bool(source.get("swh_unsigned", False)))
 
         source_tokens = 0
@@ -828,6 +844,12 @@ def build_shard(
                 source_tokens += len(tokens)
                 source_docs += 1
                 tokens_written_total += len(tokens)
+                if source_docs == 1 or source_tokens // 10_000_000 != (source_tokens - len(tokens)) // 10_000_000:
+                    log_rank0(
+                        f"Source {source['id']} progress: "
+                        f"{source_tokens:,}/{target:,} tokens, docs={source_docs:,}, "
+                        f"shard_total={tokens_written_total:,}"
+                    )
                 if source_tokens >= target:
                     break
             if source_tokens >= target:
@@ -841,8 +863,17 @@ def build_shard(
             "examples_consumed": source_examples,
             "offset": source_offsets[source["id"]],
         }
+        log_rank0(
+            f"Finished source {source['id']}: "
+            f"{source_tokens:,}/{target:,} tokens from {source_docs:,} docs "
+            f"({source_examples:,} streamed examples)"
+        )
 
     writer_stats = writer.close()
+    log_rank0(
+        f"Shard {shard_id} built: {tokens_written_total:,} tokens, "
+        f"files={writer_stats['files']}, mode_tokens={writer_stats['mode_tokens']}"
+    )
     shard_stats = {
         "id": shard_id,
         "path": str(shard_dir),
