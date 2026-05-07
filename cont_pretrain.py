@@ -1183,9 +1183,9 @@ class PackedShardBatcher:
         self.config = config
         self.batch_size = int(config["training"]["per_device_batch_size"])
         self.dataset = DatatroveFolderDataset(
-            folder_path=str(shard_dir),
-            filename_pattern=os.path.join(str(shard_dir), "**", "*.ds"),
-            seq_len=int(config["training"]["max_seq_len"]),
+            str(shard_dir),
+            int(config["training"]["max_seq_len"]),
+            filename_pattern="*.ds",
             token_size=token_size,
             recursive=True,
             shuffle=True,
