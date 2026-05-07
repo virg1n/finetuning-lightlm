@@ -131,6 +131,9 @@
   "data": {
     "hf_token": null,
     "stream_shuffle_buffer": 10000,
+    "stream_max_retries": 20,
+    "stream_retry_initial_seconds": 5.0,
+    "stream_retry_max_seconds": 120.0,
     "min_doc_chars": 32,
     "english_filter": {
       "enabled": true,
