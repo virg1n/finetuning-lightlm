@@ -84,24 +84,31 @@ class LightLMForCausalLM(PreTrainedModel, GenerationMixin):
     config_class = LightLMConfig
     base_model_prefix = "lightlm"
     supports_gradient_checkpointing = False
+    _tied_weights_keys = ["lightlm.tokens_embedding.weight", "lightlm.ll_head.weight"]
 
     def __init__(self, config: LightLMConfig):
         super().__init__(config)
         self.lightlm = Transformer(config.to_model_config())
+        self.all_tied_weights_keys = {key: key for key in self._tied_weights_keys}
+        self.tie_weights()
+
+    def tie_weights(self):
+        self.lightlm.ll_head.weight = self.lightlm.tokens_embedding.weight
 
     def get_input_embeddings(self):
         return self.lightlm.tokens_embedding
 
     def set_input_embeddings(self, value):
         self.lightlm.tokens_embedding = value
-        self.lightlm.ll_head.weight = value.weight
+        self.tie_weights()
 
     def get_output_embeddings(self):
         return self.lightlm.ll_head
 
     def set_output_embeddings(self, new_embeddings):
         self.lightlm.ll_head = new_embeddings
-        self.lightlm.tokens_embedding.weight = new_embeddings.weight
+        self.lightlm.tokens_embedding.weight = self.lightlm.ll_head.weight
+        self.all_tied_weights_keys = {key: key for key in self._tied_weights_keys}
 
     def prepare_inputs_for_generation(self, input_ids, **kwargs):
         return {"input_ids": input_ids}
