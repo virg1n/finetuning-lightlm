@@ -93,6 +93,46 @@ def log_rank0(message: str) -> None:
         print(message, flush=True)
 
 
+def get_hf_token(config: Dict[str, Any], source: Optional[Dict[str, Any]] = None) -> Optional[str]:
+    if source and source.get("hf_token"):
+        return source["hf_token"]
+    return (
+        config["data"].get("hf_token")
+        or os.environ.get("HF_TOKEN")
+        or os.environ.get("HUGGINGFACE_TOKEN")
+        or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+    )
+
+
+def has_aws_credentials() -> bool:
+    return any(
+        os.environ.get(name)
+        for name in (
+            "AWS_ACCESS_KEY_ID",
+            "AWS_PROFILE",
+            "AWS_WEB_IDENTITY_TOKEN_FILE",
+            "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+            "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+        )
+    )
+
+
+def validate_source_access(config: Dict[str, Any]) -> None:
+    for source in enabled_sources(config):
+        if source.get("requires_hf_access") and not get_hf_token(config, source):
+            raise RuntimeError(
+                f"Source {source['id']} requires a Hugging Face token and accepted dataset terms. "
+                "Run `huggingface-cli login` or `export HF_TOKEN=...`, accept the dataset terms on HF, "
+                "or set this source to enabled=false in config.json."
+            )
+        if source.get("requires_swh_s3_access") and not source.get("swh_unsigned", False) and not has_aws_credentials():
+            raise RuntimeError(
+                f"Source {source['id']} requires Software Heritage S3/AWS credentials for file contents. "
+                "Set AWS credentials after obtaining access, set swh_unsigned=true if your environment can read it "
+                "anonymously, or disable this source in config.json."
+            )
+
+
 def is_dist() -> bool:
     return dist.is_available() and dist.is_initialized()
 
@@ -446,7 +486,7 @@ def load_hf_stream(source: Dict[str, Any], config: Dict[str, Any], seed: int, sk
         kwargs["data_files"] = source["data_files"]
     if source.get("trust_remote_code"):
         kwargs["trust_remote_code"] = True
-    hf_token = source.get("hf_token", config["data"].get("hf_token"))
+    hf_token = get_hf_token(config, source)
     if hf_token:
         kwargs["token"] = hf_token
 
@@ -1398,6 +1438,7 @@ def main() -> None:
     device, rank, _local_rank, world_size = setup_distributed(config)
     set_seed(int(config["seed"]), rank)
     torch.set_float32_matmul_precision("high")
+    validate_source_access(config)
 
     tokenizer, model, _old_vocab_size = build_tokenizer_and_model(config, device)
     token_size = infer_token_size(len(tokenizer))
