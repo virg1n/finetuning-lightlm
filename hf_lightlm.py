@@ -91,6 +91,7 @@ class LightLMForCausalLM(PreTrainedModel, GenerationMixin):
         self.lightlm = Transformer(config.to_model_config())
         self.all_tied_weights_keys = {key: key for key in self._tied_weights_keys}
         self.tie_weights()
+        self.generation_config.use_cache = True
 
     def tie_weights(self, *args, **kwargs):
         del args, kwargs
@@ -119,7 +120,7 @@ class LightLMForCausalLM(PreTrainedModel, GenerationMixin):
             "input_ids": input_ids,
             "past_key_values": past_key_values,
             "attention_mask": attention_mask,
-            "use_cache": kwargs.get("use_cache", True),
+            "use_cache": True,
         }
 
     def forward(
@@ -134,6 +135,8 @@ class LightLMForCausalLM(PreTrainedModel, GenerationMixin):
         del attention_mask, kwargs
         if use_cache is None:
             use_cache = bool(self.config.use_cache)
+        elif labels is None and bool(self.config.use_cache):
+            use_cache = True
         if labels is not None:
             use_cache = False
 

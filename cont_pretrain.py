@@ -1607,6 +1607,15 @@ def export_eval_model(config: Dict[str, Any], tokenizer: Any, model: torch.nn.Mo
         "use_lossfreebalance": model_cfg["use_lossfreebalance"],
     }
     write_json(export_dir / "config.json", hf_config)
+    write_json(
+        export_dir / "generation_config.json",
+        {
+            "bos_token_id": tokenizer.bos_token_id,
+            "eos_token_id": tokenizer.eos_token_id,
+            "pad_token_id": tokenizer.pad_token_id,
+            "use_cache": True,
+        },
+    )
     shutil.copy2(Path(__file__).with_name("hf_lightlm.py"), export_dir / "hf_lightlm.py")
     shutil.copy2(Path(__file__).with_name("model.py"), export_dir / "model.py")
     return str(export_dir.resolve())
