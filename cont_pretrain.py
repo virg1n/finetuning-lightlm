@@ -8,10 +8,11 @@ import random
 import re
 import shutil
 import subprocess
+import sys
 import time
 import warnings
 from collections import defaultdict
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
@@ -80,6 +81,11 @@ KNOWN_GATED_HF_DATASETS = {
 _DIST_RUN_ID = "single"
 _RANK0_STAGE_COUNTER = 0
 
+if os.name == "nt":
+    import msvcrt
+else:
+    import fcntl
+
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -103,6 +109,44 @@ def append_jsonl(path: Path, row: Dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as f:
         f.write(json.dumps(row, sort_keys=True) + "\n")
+
+
+@contextmanager
+def file_lock(path: Path) -> Iterator[None]:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+b") as f:
+        f.seek(0)
+        if os.name == "nt":
+            msvcrt.locking(f.fileno(), msvcrt.LK_LOCK, 1)
+        else:
+            fcntl.flock(f, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            f.seek(0)
+            if os.name == "nt":
+                msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(f, fcntl.LOCK_UN)
+
+
+def manifest_lock_path(config: Dict[str, Any]) -> Path:
+    manifest_path = Path(config["paths"]["manifest_path"])
+    return manifest_path.with_suffix(manifest_path.suffix + ".lock")
+
+
+def shard_build_lock_path(config: Dict[str, Any]) -> Path:
+    return Path(config["paths"]["output_dir"]) / ".shard_build.lock"
+
+
+@contextmanager
+def locked_manifest(config: Dict[str, Any]) -> Iterator[Dict[str, Any]]:
+    manifest_path = Path(config["paths"]["manifest_path"])
+    with file_lock(manifest_lock_path(config)):
+        manifest = load_manifest(manifest_path)
+        yield manifest
+        manifest["updated_at"] = utc_now()
+        write_json(manifest_path, manifest)
 
 
 def log_rank0(message: str) -> None:
@@ -536,13 +580,17 @@ def init_special_embeddings(
             weight[token_id].copy_(base_mean)
 
 
-def build_tokenizer_and_model(config: Dict[str, Any], device: torch.device) -> Tuple[Any, Transformer, int]:
+def build_tokenizer(config: Dict[str, Any]) -> Tuple[Any, int]:
     tokenizer = AutoTokenizer.from_pretrained(config["model"]["tokenizer_name"], use_fast=True)
     old_vocab_size = len(tokenizer)
     special_tokens = config["special_tokens"]["additional_special_tokens"]
     tokenizer.add_special_tokens({"additional_special_tokens": special_tokens})
     tokenizer.pad_token = config["special_tokens"]["fim_pad"]
+    return tokenizer, old_vocab_size
 
+
+def build_tokenizer_and_model(config: Dict[str, Any], device: torch.device) -> Tuple[Any, Transformer, int]:
+    tokenizer, old_vocab_size = build_tokenizer(config)
     model_cfg = model_config_from_json(config, len(tokenizer))
     model = Transformer(model_cfg)
 
@@ -619,6 +667,22 @@ def source_targets(config: Dict[str, Any], shard_tokens: int) -> Dict[str, int]:
         for src in category_sources:
             targets[src["id"]] = int(category_tokens * float(src.get("weight", 1.0)) / total_weight)
     return targets
+
+
+def should_reset_zero_token_offset(manifest: Dict[str, Any], source: Dict[str, Any]) -> bool:
+    if not source.get("reset_offset_if_zero_tokens", False):
+        return False
+    source_id = source["id"]
+    stats = [
+        shard.get("source_stats", {}).get(source_id)
+        for shard in manifest.get("shards", [])
+        if shard.get("source_stats", {}).get(source_id) is not None
+    ]
+    if not stats:
+        return False
+    tokens = sum(int(stat.get("actual_tokens", 0)) for stat in stats)
+    examples = sum(int(stat.get("examples_consumed", 0)) for stat in stats)
+    return tokens == 0 and examples > 0
 
 
 def load_hf_stream(source: Dict[str, Any], config: Dict[str, Any], seed: int, skip: int):
@@ -815,6 +879,50 @@ def extract_stackexchange_preference_text(row: Dict[str, Any]) -> str:
     return "\n\n".join(part for part in parts if part)
 
 
+def extract_github_issue_text(row: Dict[str, Any]) -> str:
+    content = flatten_text(row.get("content")).strip()
+    if content:
+        return content
+
+    parts = []
+    for key in ("title", "body", "description"):
+        text = strip_html(flatten_text(row.get(key))).strip()
+        if text:
+            parts.append(text)
+
+    events = row.get("events")
+    comments = row.get("comments")
+    for value in (events, comments):
+        if not value:
+            continue
+        if isinstance(value, str):
+            text = strip_html(value).strip()
+            if text:
+                parts.append(text)
+            continue
+        if isinstance(value, dict):
+            value = value.get("events") or value.get("comments") or value.get("items") or [value]
+        if not isinstance(value, list):
+            value = [value]
+        for item in value:
+            if isinstance(item, dict):
+                text = (
+                    item.get("text")
+                    or item.get("body")
+                    or item.get("comment")
+                    or item.get("content")
+                    or item.get("description")
+                    or ""
+                )
+            else:
+                text = flatten_text(item)
+            text = strip_html(flatten_text(text)).strip()
+            if text:
+                parts.append(text)
+
+    return "\n\n".join(parts)
+
+
 def row_to_documents(
     row: Dict[str, Any],
     source: Dict[str, Any],
@@ -851,6 +959,10 @@ def row_to_documents(
         text = extract_python_notebook(text)
     elif processor == "stackexchange_preference_qa":
         text = extract_stackexchange_preference_text(row)
+    elif processor == "github_issue_conversation":
+        text = extract_github_issue_text(row)
+    elif not text and source.get("id") == "github_issues":
+        text = extract_github_issue_text(row)
     doc = {
         "text": text,
         "category": source["category"],
@@ -1029,6 +1141,14 @@ def build_shard(
     source_stats: Dict[str, Any] = {}
     tokens_written_total = 0
     shard_start_tokens = int(manifest.get("tokens_prepared", 0))
+    for source in enabled_sources(config):
+        source_id = source["id"]
+        if int(source_offsets.get(source_id, 0)) > 0 and should_reset_zero_token_offset(manifest, source):
+            log_rank0(
+                f"Resetting source offset for {source_id}: previous shards consumed examples "
+                "but produced zero tokens."
+            )
+            source_offsets[source_id] = 0
     log_rank0(
         f"Building shard {shard_id} at {shard_dir} "
         f"target={shard_target:,} tokens start={shard_start_tokens:,}"
@@ -1060,6 +1180,9 @@ def build_shard(
         consecutive_stream_errors = 0
         max_stream_retries, retry_initial_seconds, retry_max_seconds = stream_retry_settings(config, source)
         source_exhausted = False
+        max_empty_examples = int(
+            source.get("max_empty_examples", config["data"].get("max_empty_examples_per_source", 500_000))
+        )
 
         def retry_stream_error(exc: Exception, stream_skip: int) -> None:
             nonlocal consecutive_stream_errors, stream_retries
@@ -1101,6 +1224,13 @@ def build_shard(
                     break
                 consecutive_stream_errors = 0
                 source_examples += 1
+                if source_docs == 0 and source_examples >= max_empty_examples:
+                    keys = ", ".join(sorted(str(key) for key in row.keys()))
+                    raise RuntimeError(
+                        f"Source {source['id']} produced zero accepted documents after "
+                        f"{source_examples:,} streamed examples. Check text_field/content_processor "
+                        f"for this dataset. Last row keys: {keys}"
+                    )
                 for doc in row_to_documents(row, source, swh_client):
                     if not keep_document(doc, source, config):
                         continue
@@ -1163,11 +1293,22 @@ def build_shard(
     }
     write_json(shard_dir / "shard_stats.json", shard_stats)
 
-    manifest["tokens_prepared"] = shard_start_tokens + tokens_written_total
-    manifest["source_offsets"] = source_offsets
-    manifest["updated_at"] = utc_now()
-    manifest["shards"].append(shard_stats)
-    write_json(Path(config["paths"]["manifest_path"]), manifest)
+    with locked_manifest(config) as current_manifest:
+        if int(current_manifest.get("tokens_prepared", 0)) != shard_start_tokens:
+            raise RuntimeError(
+                "Manifest tokens_prepared changed while building shard "
+                f"{shard_id}: expected {shard_start_tokens:,}, "
+                f"found {int(current_manifest.get('tokens_prepared', 0)):,}."
+            )
+        if len(current_manifest.get("shards", [])) != shard_id:
+            raise RuntimeError(
+                "Manifest shard list changed while building shard "
+                f"{shard_id}: expected length {shard_id}, "
+                f"found {len(current_manifest.get('shards', []))}."
+            )
+        current_manifest["tokens_prepared"] = shard_start_tokens + tokens_written_total
+        current_manifest["source_offsets"] = source_offsets
+        current_manifest["shards"].append(shard_stats)
     return shard_stats
 
 
@@ -1471,6 +1612,38 @@ def export_eval_model(config: Dict[str, Any], tokenizer: Any, model: torch.nn.Mo
     return str(export_dir.resolve())
 
 
+def eval_format_values(
+    output_dir: str,
+    global_step: int,
+    tokens_trained: int,
+    checkpoint: str,
+    eval_model: str,
+    metric_output_path: str = "",
+    stdout_log_file: str = "",
+) -> Dict[str, Any]:
+    return {
+        "output_dir": output_dir,
+        "step": global_step,
+        "tokens": tokens_trained,
+        "checkpoint": checkpoint,
+        "eval_model": eval_model,
+        "metric_output_path": metric_output_path,
+        "stdout_log_file": stdout_log_file,
+    }
+
+
+def compact_eval_results(path: Path) -> Optional[Any]:
+    if not path.exists():
+        return None
+    try:
+        payload = read_json(path)
+    except (json.JSONDecodeError, OSError):
+        return None
+    if isinstance(payload, dict) and "results" in payload:
+        return payload["results"]
+    return payload
+
+
 def run_bigcode_eval(
     config: Dict[str, Any],
     tokenizer: Any,
@@ -1494,15 +1667,27 @@ def run_bigcode_eval(
     if eval_model == output_dir:
         eval_model = export_eval_model(config, tokenizer, model)
     checkpoint = str(checkpoint_path.resolve()) if checkpoint_path else ""
+    base_format_values = eval_format_values(output_dir, global_step, tokens_trained, checkpoint, eval_model)
+    metric_output_path = eval_cfg.get(
+        "metric_output_path",
+        "{output_dir}/eval_results_step_{step}.json",
+    ).format(**base_format_values)
+    stdout_log_file = eval_cfg.get(
+        "stdout_log_file",
+        "{output_dir}/logs/eval_stdout_step_{step}.log",
+    ).format(**base_format_values)
+    format_values = eval_format_values(
+        output_dir,
+        global_step,
+        tokens_trained,
+        checkpoint,
+        eval_model,
+        metric_output_path,
+        stdout_log_file,
+    )
 
     command = [
-        part.format(
-            output_dir=output_dir,
-            step=global_step,
-            tokens=tokens_trained,
-            checkpoint=checkpoint,
-            eval_model=eval_model,
-        )
+        part.format(**format_values)
         for part in eval_cfg.get("command", [])
     ]
     log_path = Path(config["paths"]["eval_log_file"])
@@ -1513,6 +1698,8 @@ def run_bigcode_eval(
             "step": global_step,
             "tokens_trained": tokens_trained,
             "command": command,
+            "metric_output_path": metric_output_path,
+            "stdout_log_file": stdout_log_file,
             "time": utc_now(),
         },
     )
@@ -1533,10 +1720,11 @@ def run_bigcode_eval(
             },
         )
         return False
-    with log_path.open("a", encoding="utf-8") as f:
-        f.write(json.dumps({"event": "bigcode_eval_stdout_begin", "step": global_step}) + "\n")
+    stdout_path = Path(stdout_log_file)
+    stdout_path.parent.mkdir(parents=True, exist_ok=True)
+    with stdout_path.open("w", encoding="utf-8") as f:
         result = subprocess.run(command, cwd=cwd, stdout=f, stderr=subprocess.STDOUT, text=True, check=False)
-        f.write(json.dumps({"event": "bigcode_eval_stdout_end", "step": global_step}) + "\n")
+    eval_results = compact_eval_results(Path(metric_output_path))
     append_jsonl(
         log_path,
         {
@@ -1544,6 +1732,9 @@ def run_bigcode_eval(
             "step": global_step,
             "tokens_trained": tokens_trained,
             "returncode": result.returncode,
+            "results": eval_results,
+            "metric_output_path": metric_output_path,
+            "stdout_log_file": stdout_log_file,
             "time": utc_now(),
         },
     )
@@ -1560,15 +1751,12 @@ def run_bigcode_eval(
 
 
 def mark_shard_status(config: Dict[str, Any], shard_id: int, status: str, **extra: Any) -> None:
-    manifest_path = Path(config["paths"]["manifest_path"])
-    manifest = load_manifest(manifest_path)
-    for shard in manifest["shards"]:
-        if int(shard["id"]) == int(shard_id):
-            shard["status"] = status
-            shard.update(extra)
-            break
-    manifest["updated_at"] = utc_now()
-    write_json(manifest_path, manifest)
+    with locked_manifest(config) as manifest:
+        for shard in manifest["shards"]:
+            if int(shard["id"]) == int(shard_id):
+                shard["status"] = status
+                shard.update(extra)
+                break
 
 
 def train_shard(
@@ -1701,7 +1889,13 @@ def train_shard(
             manifest["global_step"] = global_step
             manifest["tokens_trained"] = tokens_trained
             run_bigcode_eval(config, tokenizer, model, global_step, tokens_trained, last_checkpoint, manifest)
-            write_json(Path(config["paths"]["manifest_path"]), manifest)
+            with locked_manifest(config) as current_manifest:
+                current_manifest["global_step"] = global_step
+                current_manifest["tokens_trained"] = tokens_trained
+                current_manifest["next_eval_tokens"] = manifest.get(
+                    "next_eval_tokens",
+                    current_manifest.get("next_eval_tokens", 0),
+                )
 
     if rank0():
         last_checkpoint = save_checkpoint(
@@ -1711,7 +1905,13 @@ def train_shard(
         manifest["global_step"] = global_step
         manifest["tokens_trained"] = tokens_trained
         run_bigcode_eval(config, tokenizer, model, global_step, tokens_trained, last_checkpoint, manifest)
-        write_json(Path(config["paths"]["manifest_path"]), manifest)
+        with locked_manifest(config) as current_manifest:
+            current_manifest["global_step"] = global_step
+            current_manifest["tokens_trained"] = tokens_trained
+            current_manifest["next_eval_tokens"] = manifest.get(
+                "next_eval_tokens",
+                current_manifest.get("next_eval_tokens", 0),
+            )
         append_jsonl(
             train_log,
             {
@@ -1733,6 +1933,98 @@ def next_shard_to_train(manifest: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     return None
 
 
+def count_prefetch_shards(manifest: Dict[str, Any]) -> int:
+    return sum(1 for shard in manifest.get("shards", []) if shard.get("status") in {"built", "training"})
+
+
+def build_next_shard(config: Dict[str, Any], tokenizer: Any, token_size: int) -> Optional[Dict[str, Any]]:
+    with file_lock(shard_build_lock_path(config)):
+        manifest = load_manifest(Path(config["paths"]["manifest_path"]))
+        if int(manifest.get("tokens_prepared", 0)) >= int(config["tokens"]["target_total_tokens"]):
+            return None
+        return build_shard(config, manifest, len(manifest.get("shards", [])), tokenizer, token_size)
+
+
+def shard_producer_log_path(config: Dict[str, Any]) -> Path:
+    return Path(config["paths"]["output_dir"]) / "logs" / "shard_producer.log"
+
+
+def shard_producer_loop(config: Dict[str, Any], tokenizer: Any, token_size: int) -> None:
+    prefetch_shards = max(1, int(config["training"].get("prefetch_shards", 2)))
+    poll_seconds = max(1.0, float(config["training"].get("shard_producer_poll_seconds", 15.0)))
+    log_rank0(f"Shard producer started with prefetch_shards={prefetch_shards}")
+
+    while True:
+        manifest = load_manifest(Path(config["paths"]["manifest_path"]))
+        if int(manifest.get("tokens_prepared", 0)) >= int(config["tokens"]["target_total_tokens"]):
+            log_rank0("Shard producer finished: target tokens are prepared.")
+            return
+        if count_prefetch_shards(manifest) >= prefetch_shards:
+            time.sleep(poll_seconds)
+            continue
+        build_next_shard(config, tokenizer, token_size)
+
+
+def start_shard_producer(config: Dict[str, Any], config_path: str) -> subprocess.Popen:
+    log_path = shard_producer_log_path(config)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    env = os.environ.copy()
+    for key in ("RANK", "LOCAL_RANK", "WORLD_SIZE", "GROUP_RANK", "ROLE_RANK", "LOCAL_WORLD_SIZE"):
+        env.pop(key, None)
+    env["CUDA_VISIBLE_DEVICES"] = ""
+    env["PYTHONUNBUFFERED"] = "1"
+    command = [sys.executable, str(Path(__file__).resolve()), "--config", config_path, "--shard-producer"]
+    log_file = log_path.open("ab", buffering=0)
+    process = subprocess.Popen(
+        command,
+        cwd=str(Path.cwd()),
+        env=env,
+        stdout=log_file,
+        stderr=subprocess.STDOUT,
+    )
+    process._lightlm_log_file = log_file  # type: ignore[attr-defined]
+    log_rank0(f"Started shard producer pid={process.pid}; log={log_path}")
+    return process
+
+
+def stop_shard_producer(process: Optional[subprocess.Popen]) -> None:
+    if process is None:
+        return
+    if process.poll() is None:
+        process.terminate()
+        try:
+            process.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=30)
+    log_file = getattr(process, "_lightlm_log_file", None)
+    if log_file is not None:
+        log_file.close()
+
+
+def wait_for_produced_shard(
+    config: Dict[str, Any],
+    producer: Optional[subprocess.Popen],
+) -> Optional[Dict[str, Any]]:
+    poll_seconds = max(1.0, float(config["training"].get("shard_producer_poll_seconds", 15.0)))
+    while True:
+        manifest = load_manifest(Path(config["paths"]["manifest_path"]))
+        shard = next_shard_to_train(manifest)
+        if shard is not None:
+            return shard
+        if int(manifest.get("tokens_prepared", 0)) >= int(config["tokens"]["target_total_tokens"]):
+            return None
+        if producer is not None:
+            returncode = producer.poll()
+            if returncode is not None:
+                log_path = shard_producer_log_path(config)
+                raise RuntimeError(
+                    f"Shard producer exited with code {returncode} before a shard was ready. "
+                    f"See {log_path}."
+                )
+        time.sleep(poll_seconds)
+
+
 def safe_delete_shard(shard_path: Path, shard_root: Path) -> None:
     root = shard_root.resolve()
     target = shard_path.resolve()
@@ -1746,9 +2038,17 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Continue pretrain LightLM on code shards.")
     parser.add_argument("--config", default="config.json")
     parser.add_argument("--prepare-only", action="store_true")
+    parser.add_argument("--shard-producer", action="store_true")
     args = parser.parse_args()
 
     config = read_json(Path(args.config))
+    if args.shard_producer:
+        set_seed(int(config["seed"]), 0)
+        tokenizer, _old_vocab_size = build_tokenizer(config)
+        token_size = infer_token_size(len(tokenizer))
+        shard_producer_loop(config, tokenizer, token_size)
+        return
+
     if config["training"].get("compile", False):
         suppress_known_compile_warnings()
     device, rank, _local_rank, world_size = setup_distributed(config)
@@ -1818,53 +2118,76 @@ def main() -> None:
             else:
                 manifest["initial_eval_done"] = False
                 print("Initial BigCode eval failed or was skipped; see eval log.")
-            manifest["updated_at"] = utc_now()
-            write_json(manifest_path, manifest)
+            with locked_manifest(config) as current_manifest:
+                current_manifest["initial_eval_done"] = manifest["initial_eval_done"]
+                current_manifest["next_eval_tokens"] = manifest.get(
+                    "next_eval_tokens",
+                    current_manifest.get("next_eval_tokens", 0),
+                )
 
     run_rank0_stage(config, "startup", startup_rank0_stage)
 
-    while True:
-        def prepare_or_mark_shard_stage() -> None:
-            manifest_path = Path(config["paths"]["manifest_path"])
-            manifest = load_manifest(manifest_path)
-            shard = next_shard_to_train(manifest)
-            if shard is None and int(manifest["tokens_prepared"]) < int(config["tokens"]["target_total_tokens"]):
-                shard = build_shard(config, manifest, len(manifest["shards"]), tokenizer, token_size)
-            if shard is not None and not args.prepare_only:
-                mark_shard_status(config, int(shard["id"]), "training")
+    parallel_shard_building = (
+        bool(config["training"].get("parallel_shard_building", True))
+        and not args.prepare_only
+        and rank0()
+    )
+    shard_producer: Optional[subprocess.Popen] = None
 
-        run_rank0_stage(config, "prepare_or_mark_shard", prepare_or_mark_shard_stage)
+    def start_shard_producer_stage() -> None:
+        nonlocal shard_producer
+        if parallel_shard_building:
+            shard_producer = start_shard_producer(config, args.config)
 
-        manifest = load_manifest(Path(config["paths"]["manifest_path"]))
-        shard = next_shard_to_train(manifest)
-        if shard is None:
-            break
-        if args.prepare_only:
-            break
+    run_rank0_stage(config, "start_shard_producer", start_shard_producer_stage)
 
-        train_shard(
-            config,
-            shard,
-            tokenizer,
-            model,
-            optimizer,
-            token_size,
-            device,
-            rank,
-            world_size,
-            resume_state,
-        )
-        resume_state = {}
-        barrier()
+    try:
+        while True:
+            def prepare_or_mark_shard_stage() -> None:
+                manifest = load_manifest(Path(config["paths"]["manifest_path"]))
+                shard = next_shard_to_train(manifest)
+                if shard is None and int(manifest["tokens_prepared"]) < int(config["tokens"]["target_total_tokens"]):
+                    if config["training"].get("parallel_shard_building", True) and not args.prepare_only:
+                        shard = wait_for_produced_shard(config, shard_producer)
+                    else:
+                        shard = build_next_shard(config, tokenizer, token_size)
+                if shard is not None and not args.prepare_only:
+                    mark_shard_status(config, int(shard["id"]), "training")
 
-        def finish_shard_stage() -> None:
+            run_rank0_stage(config, "prepare_or_mark_shard", prepare_or_mark_shard_stage)
+
             manifest = load_manifest(Path(config["paths"]["manifest_path"]))
-            mark_shard_status(config, int(shard["id"]), "trained", trained_at=utc_now())
-            if config["training"].get("delete_shard_after_train", True):
-                safe_delete_shard(Path(shard["path"]), Path(config["paths"]["shard_root"]))
-                mark_shard_status(config, int(shard["id"]), "deleted", deleted_at=utc_now())
+            shard = next_shard_to_train(manifest)
+            if shard is None:
+                break
+            if args.prepare_only:
+                break
 
-        run_rank0_stage(config, f"finish_shard_{int(shard['id'])}", finish_shard_stage)
+            global_step, tokens_trained = train_shard(
+                config,
+                shard,
+                tokenizer,
+                model,
+                optimizer,
+                token_size,
+                device,
+                rank,
+                world_size,
+                resume_state,
+            )
+            resume_state = {"global_step": global_step, "tokens_trained": tokens_trained}
+            barrier()
+
+            def finish_shard_stage() -> None:
+                mark_shard_status(config, int(shard["id"]), "trained", trained_at=utc_now())
+                if config["training"].get("delete_shard_after_train", True):
+                    safe_delete_shard(Path(shard["path"]), Path(config["paths"]["shard_root"]))
+                    mark_shard_status(config, int(shard["id"]), "deleted", deleted_at=utc_now())
+
+            run_rank0_stage(config, f"finish_shard_{int(shard['id'])}", finish_shard_stage)
+    finally:
+        if rank0():
+            stop_shard_producer(shard_producer)
 
     cleanup_distributed()
 

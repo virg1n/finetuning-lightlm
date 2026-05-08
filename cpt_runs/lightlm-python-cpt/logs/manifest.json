@@ -1,0 +1,994 @@
+{
+  "created_at": "2026-05-07T15:11:01.362849+00:00",
+  "global_step": 177,
+  "initial_eval_done": false,
+  "next_eval_tokens": 2000000000,
+  "shards": [
+    {
+      "actual_tokens": 185939449,
+      "created_at": "2026-05-07T21:42:35.300994+00:00",
+      "deleted_at": "2026-05-08T00:17:59.727680+00:00",
+      "files": 3,
+      "id": 0,
+      "mode_docs": {
+        "fim_psm": 4362,
+        "fim_spm": 4279,
+        "standard": 124744
+      },
+      "mode_tokens": {
+        "fim_psm": 7778098,
+        "fim_spm": 8936481,
+        "standard": 169224870
+      },
+      "path": "datasets/cpt_shards/shard_00000",
+      "source_stats": {
+        "arxiv_cs_abstracts": {
+          "actual_tokens": 5000288,
+          "documents": 24100,
+          "examples_consumed": 24101,
+          "offset": 24101,
+          "stream_retries": 0,
+          "target_tokens": 5000000
+        },
+        "codeparrot_clean": {
+          "actual_tokens": 60159665,
+          "documents": 20262,
+          "examples_consumed": 20262,
+          "offset": 20262,
+          "stream_retries": 0,
+          "target_tokens": 60000000
+        },
+        "cosmopedia_replay": {
+          "actual_tokens": 10000789,
+          "documents": 13921,
+          "examples_consumed": 13921,
+          "offset": 13921,
+          "stream_retries": 0,
+          "target_tokens": 10000000
+        },
+        "github_issue_pr_sample": {
+          "actual_tokens": 757730,
+          "documents": 93,
+          "examples_consumed": 100,
+          "offset": 100,
+          "stream_retries": 0,
+          "target_tokens": 5000000
+        },
+        "github_issues": {
+          "actual_tokens": 0,
+          "documents": 0,
+          "examples_consumed": 30982955,
+          "offset": 30982955,
+          "stream_retries": 0,
+          "target_tokens": 10000000
+        },
+        "stackexchange_stackoverflow": {
+          "actual_tokens": 10000351,
+          "documents": 12315,
+          "examples_consumed": 12316,
+          "offset": 12316,
+          "stream_retries": 0,
+          "target_tokens": 10000000
+        },
+        "starcoder_c": {
+          "actual_tokens": 2505341,
+          "documents": 1211,
+          "examples_consumed": 1213,
+          "offset": 1213,
+          "stream_retries": 0,
+          "target_tokens": 2500000
+        },
+        "starcoder_go": {
+          "actual_tokens": 2500106,
+          "documents": 1500,
+          "examples_consumed": 1500,
+          "offset": 1500,
+          "stream_retries": 0,
+          "target_tokens": 2500000
+        },
+        "starcoder_javascript": {
+          "actual_tokens": 2501839,
+          "documents": 2083,
+          "examples_consumed": 2085,
+          "offset": 2085,
+          "stream_retries": 0,
+          "target_tokens": 2500000
+        },
+        "starcoder_python": {
+          "actual_tokens": 60010945,
+          "documents": 43010,
+          "examples_consumed": 43214,
+          "offset": 43214,
+          "stream_retries": 0,
+          "target_tokens": 60000000
+        },
+        "starcoder_rust": {
+          "actual_tokens": 2500065,
+          "documents": 1234,
+          "examples_consumed": 1237,
+          "offset": 1237,
+          "stream_retries": 0,
+          "target_tokens": 2500000
+        },
+        "the_stack_jupyter_notebooks": {
+          "actual_tokens": 30002330,
+          "documents": 13656,
+          "examples_consumed": 14589,
+          "offset": 14589,
+          "stream_retries": 0,
+          "target_tokens": 30000000
+        }
+      },
+      "status": "deleted",
+      "target_tokens": 200000000,
+      "tokens_end": 185939449,
+      "tokens_start": 0,
+      "trained_at": "2026-05-08T00:17:59.679536+00:00"
+    },
+    {
+      "actual_tokens": 185785306,
+      "created_at": "2026-05-08T01:15:59.746328+00:00",
+      "deleted_at": "2026-05-08T01:29:32.351106+00:00",
+      "files": 3,
+      "id": 1,
+      "mode_docs": {
+        "fim_psm": 4930,
+        "fim_spm": 4864,
+        "standard": 123431
+      },
+      "mode_tokens": {
+        "fim_psm": 9419267,
+        "fim_spm": 8529622,
+        "standard": 167836417
+      },
+      "path": "datasets/cpt_shards/shard_00001",
+      "source_stats": {
+        "arxiv_cs_abstracts": {
+          "actual_tokens": 5000169,
+          "documents": 24106,
+          "examples_consumed": 24108,
+          "offset": 48209,
+          "stream_retries": 0,
+          "target_tokens": 5000000
+        },
+        "codeparrot_clean": {
+          "actual_tokens": 60001520,
+          "documents": 21185,
+          "examples_consumed": 21185,
+          "offset": 41447,
+          "stream_retries": 0,
+          "target_tokens": 60000000
+        },
+        "cosmopedia_replay": {
+          "actual_tokens": 10000562,
+          "documents": 13924,
+          "examples_consumed": 13924,
+          "offset": 27845,
+          "stream_retries": 0,
+          "target_tokens": 10000000
+        },
+        "github_issue_pr_sample": {
+          "actual_tokens": 757730,
+          "documents": 93,
+          "examples_consumed": 99,
+          "offset": 199,
+          "stream_retries": 0,
+          "target_tokens": 5000000
+        },
+        "github_issues": {
+          "actual_tokens": 0,
+          "documents": 0,
+          "examples_consumed": 30982954,
+          "offset": 61965909,
+          "stream_retries": 0,
+          "target_tokens": 10000000
+        },
+        "stackexchange_stackoverflow": {
+          "actual_tokens": 10000432,
+          "documents": 10357,
+          "examples_consumed": 10364,
+          "offset": 22680,
+          "stream_retries": 0,
+          "target_tokens": 10000000
+        },
+        "starcoder_c": {
+          "actual_tokens": 2517122,
+          "documents": 689,
+          "examples_consumed": 692,
+          "offset": 1905,
+          "stream_retries": 0,
+          "target_tokens": 2500000
+        },
+        "starcoder_go": {
+          "actual_tokens": 2502522,
+          "documents": 1329,
+          "examples_consumed": 1329,
+          "offset": 2829,
+          "stream_retries": 0,
+          "target_tokens": 2500000
+        },
+        "starcoder_javascript": {
+          "actual_tokens": 2500619,
+          "documents": 2322,
+          "examples_consumed": 2326,
+          "offset": 4411,
+          "stream_retries": 0,
+          "target_tokens": 2500000
+        },
+        "starcoder_python": {
+          "actual_tokens": 60000783,
+          "documents": 43694,
+          "examples_consumed": 43905,
+          "offset": 87119,
+          "stream_retries": 0,
+          "target_tokens": 60000000
+        },
+        "starcoder_rust": {
+          "actual_tokens": 2503336,
+          "documents": 1314,
+          "examples_consumed": 1317,
+          "offset": 2554,
+          "stream_retries": 0,
+          "target_tokens": 2500000
+        },
+        "the_stack_jupyter_notebooks": {
+          "actual_tokens": 30000511,
+          "documents": 14212,
+          "examples_consumed": 15220,
+          "offset": 29809,
+          "stream_retries": 0,
+          "target_tokens": 30000000
+        }
+      },
+      "status": "deleted",
+      "target_tokens": 200000000,
+      "tokens_end": 371724755,
+      "tokens_start": 185939449,
+      "trained_at": "2026-05-08T01:29:32.295863+00:00"
+    },
+    {
+      "actual_tokens": 185829666,
+      "created_at": "2026-05-08T02:23:27.126401+00:00",
+      "deleted_at": "2026-05-08T02:36:53.469623+00:00",
+      "files": 3,
+      "id": 2,
+      "mode_docs": {
+        "fim_psm": 5348,
+        "fim_spm": 5294,
+        "standard": 121040
+      },
+      "mode_tokens": {
+        "fim_psm": 10145508,
+        "fim_spm": 10739128,
+        "standard": 164945030
+      },
+      "path": "datasets/cpt_shards/shard_00002",
+      "source_stats": {
+        "arxiv_cs_abstracts": {
+          "actual_tokens": 5000039,
+          "documents": 24045,
+          "examples_consumed": 24048,
+          "offset": 72257,
+          "stream_retries": 0,
+          "target_tokens": 5000000
+        },
+        "codeparrot_clean": {
+          "actual_tokens": 60000990,
+          "documents": 20822,
+          "examples_consumed": 20822,
+          "offset": 62269,
+          "stream_retries": 0,
+          "target_tokens": 60000000
+        },
+        "cosmopedia_replay": {
+          "actual_tokens": 10000400,
+          "documents": 13880,
+          "examples_consumed": 13880,
+          "offset": 41725,
+          "stream_retries": 0,
+          "target_tokens": 10000000
+        },
+        "github_issue_pr_sample": {
+          "actual_tokens": 757730,
+          "documents": 93,
+          "examples_consumed": 99,
+          "offset": 298,
+          "stream_retries": 0,
+          "target_tokens": 5000000
+        },
+        "github_issues": {
+          "actual_tokens": 0,
+          "documents": 0,
+          "examples_consumed": 30982954,
+          "offset": 92948863,
+          "stream_retries": 0,
+          "target_tokens": 10000000
+        },
+        "stackexchange_stackoverflow": {
+          "actual_tokens": 10000697,
+          "documents": 10935,
+          "examples_consumed": 10940,
+          "offset": 33620,
+          "stream_retries": 0,
+          "target_tokens": 10000000
+        },
+        "starcoder_c": {
+          "actual_tokens": 2501420,
+          "documents": 1078,
+          "examples_consumed": 1078,
+          "offset": 2983,
+          "stream_retries": 0,
+          "target_tokens": 2500000
+        },
+        "starcoder_go": {
+          "actual_tokens": 2516190,
+          "documents": 1178,
+          "examples_consumed": 1178,
+          "offset": 4007,
+          "stream_retries": 0,
+          "target_tokens": 2500000
+        },
+        "starcoder_javascript": {
+          "actual_tokens": 2501170,
+          "documents": 2336,
+          "examples_consumed": 2341,
+          "offset": 6752,
+          "stream_retries": 0,
+          "target_tokens": 2500000
+        },
+        "starcoder_python": {
+          "actual_tokens": 60002582,
+          "documents": 42462,
+          "examples_consumed": 42678,
+          "offset": 129797,
+          "stream_retries": 0,
+          "target_tokens": 60000000
+        },
+        "starcoder_rust": {
+          "actual_tokens": 2546916,
+          "documents": 1402,
+          "examples_consumed": 1404,
+          "offset": 3958,
+          "stream_retries": 0,
+          "target_tokens": 2500000
+        },
+        "the_stack_jupyter_notebooks": {
+          "actual_tokens": 30001532,
+          "documents": 13451,
+          "examples_consumed": 14364,
+          "offset": 44173,
+          "stream_retries": 0,
+          "target_tokens": 30000000
+        }
+      },
+      "status": "deleted",
+      "target_tokens": 200000000,
+      "tokens_end": 557554421,
+      "tokens_start": 371724755,
+      "trained_at": "2026-05-08T02:36:53.415393+00:00"
+    },
+    {
+      "actual_tokens": 185784742,
+      "created_at": "2026-05-08T03:31:19.216438+00:00",
+      "deleted_at": "2026-05-08T03:44:51.943137+00:00",
+      "files": 3,
+      "id": 3,
+      "mode_docs": {
+        "fim_psm": 5690,
+        "fim_spm": 5736,
+        "standard": 119350
+      },
+      "mode_tokens": {
+        "fim_psm": 11445550,
+        "fim_spm": 11447023,
+        "standard": 162892169
+      },
+      "path": "datasets/cpt_shards/shard_00003",
+      "source_stats": {
+        "arxiv_cs_abstracts": {
+          "actual_tokens": 5000113,
+          "documents": 24065,
+          "examples_consumed": 24066,
+          "offset": 96323,
+          "stream_retries": 0,
+          "target_tokens": 5000000
+        },
+        "codeparrot_clean": {
+          "actual_tokens": 60004405,
+          "documents": 20973,
+          "examples_consumed": 20973,
+          "offset": 83242,
+          "stream_retries": 0,
+          "target_tokens": 60000000
+        },
+        "cosmopedia_replay": {
+          "actual_tokens": 10000263,
+          "documents": 13904,
+          "examples_consumed": 13904,
+          "offset": 55629,
+          "stream_retries": 0,
+          "target_tokens": 10000000
+        },
+        "github_issue_pr_sample": {
+          "actual_tokens": 746799,
+          "documents": 92,
+          "examples_consumed": 99,
+          "offset": 397,
+          "stream_retries": 0,
+          "target_tokens": 5000000
+        },
+        "github_issues": {
+          "actual_tokens": 0,
+          "documents": 0,
+          "examples_consumed": 30982954,
+          "offset": 123931817,
+          "stream_retries": 0,
+          "target_tokens": 10000000
+        },
+        "stackexchange_stackoverflow": {
+          "actual_tokens": 10000177,
+          "documents": 9759,
+          "examples_consumed": 9765,
+          "offset": 43385,
+          "stream_retries": 0,
+          "target_tokens": 10000000
+        },
+        "starcoder_c": {
+          "actual_tokens": 2503849,
+          "documents": 668,
+          "examples_consumed": 668,
+          "offset": 3651,
+          "stream_retries": 0,
+          "target_tokens": 2500000
+        },
+        "starcoder_go": {
+          "actual_tokens": 2500762,
+          "documents": 1639,
+          "examples_consumed": 1639,
+          "offset": 5646,
+          "stream_retries": 0,
+          "target_tokens": 2500000
+        },
+        "starcoder_javascript": {
+          "actual_tokens": 2500486,
+          "documents": 2531,
+          "examples_consumed": 2540,
+          "offset": 9292,
+          "stream_retries": 0,
+          "target_tokens": 2500000
+        },
+        "starcoder_python": {
+          "actual_tokens": 60026714,
+          "documents": 43021,
+          "examples_consumed": 43220,
+          "offset": 173017,
+          "stream_retries": 0,
+          "target_tokens": 60000000
+        },
+        "starcoder_rust": {
+          "actual_tokens": 2500358,
+          "documents": 1066,
+          "examples_consumed": 1069,
+          "offset": 5027,
+          "stream_retries": 0,
+          "target_tokens": 2500000
+        },
+        "the_stack_jupyter_notebooks": {
+          "actual_tokens": 30000816,
+          "documents": 13058,
+          "examples_consumed": 13939,
+          "offset": 58112,
+          "stream_retries": 0,
+          "target_tokens": 30000000
+        }
+      },
+      "status": "deleted",
+      "target_tokens": 200000000,
+      "tokens_end": 743339163,
+      "tokens_start": 557554421,
+      "trained_at": "2026-05-08T03:44:51.894054+00:00"
+    },
+    {
+      "actual_tokens": 185780110,
+      "created_at": "2026-05-08T04:48:47.078073+00:00",
+      "deleted_at": "2026-05-08T05:02:12.102439+00:00",
+      "files": 3,
+      "id": 4,
+      "mode_docs": {
+        "fim_psm": 6405,
+        "fim_spm": 6289,
+        "standard": 120719
+      },
+      "mode_tokens": {
+        "fim_psm": 13175832,
+        "fim_spm": 11464464,
+        "standard": 161139814
+      },
+      "path": "datasets/cpt_shards/shard_00004",
+      "source_stats": {
+        "arxiv_cs_abstracts": {
+          "actual_tokens": 5000100,
+          "documents": 24066,
+          "examples_consumed": 24067,
+          "offset": 120390,
+          "stream_retries": 0,
+          "target_tokens": 5000000
+        },
+        "codeparrot_clean": {
+          "actual_tokens": 60000386,
+          "documents": 21050,
+          "examples_consumed": 21050,
+          "offset": 104292,
+          "stream_retries": 0,
+          "target_tokens": 60000000
+        },
+        "cosmopedia_replay": {
+          "actual_tokens": 10000463,
+          "documents": 13891,
+          "examples_consumed": 13891,
+          "offset": 69520,
+          "stream_retries": 0,
+          "target_tokens": 10000000
+        },
+        "github_issue_pr_sample": {
+          "actual_tokens": 747817,
+          "documents": 92,
+          "examples_consumed": 99,
+          "offset": 496,
+          "stream_retries": 0,
+          "target_tokens": 5000000
+        },
+        "github_issues": {
+          "actual_tokens": 0,
+          "documents": 0,
+          "examples_consumed": 30982954,
+          "offset": 154914771,
+          "stream_retries": 0,
+          "target_tokens": 10000000
+        },
+        "stackexchange_stackoverflow": {
+          "actual_tokens": 10001935,
+          "documents": 10349,
+          "examples_consumed": 10353,
+          "offset": 53738,
+          "stream_retries": 0,
+          "target_tokens": 10000000
+        },
+        "starcoder_c": {
+          "actual_tokens": 2503662,
+          "documents": 1178,
+          "examples_consumed": 1180,
+          "offset": 4831,
+          "stream_retries": 0,
+          "target_tokens": 2500000
+        },
+        "starcoder_go": {
+          "actual_tokens": 2522972,
+          "documents": 905,
+          "examples_consumed": 905,
+          "offset": 6551,
+          "stream_retries": 0,
+          "target_tokens": 2500000
+        },
+        "starcoder_javascript": {
+          "actual_tokens": 2500083,
+          "documents": 2296,
+          "examples_consumed": 2301,
+          "offset": 11593,
+          "stream_retries": 0,
+          "target_tokens": 2500000
+        },
+        "starcoder_python": {
+          "actual_tokens": 60000401,
+          "documents": 44520,
+          "examples_consumed": 44761,
+          "offset": 217778,
+          "stream_retries": 0,
+          "target_tokens": 60000000
+        },
+        "starcoder_rust": {
+          "actual_tokens": 2501294,
+          "documents": 1312,
+          "examples_consumed": 1317,
+          "offset": 6344,
+          "stream_retries": 0,
+          "target_tokens": 2500000
+        },
+        "the_stack_jupyter_notebooks": {
+          "actual_tokens": 30000997,
+          "documents": 13754,
+          "examples_consumed": 14721,
+          "offset": 72833,
+          "stream_retries": 0,
+          "target_tokens": 30000000
+        }
+      },
+      "status": "deleted",
+      "target_tokens": 200000000,
+      "tokens_end": 929119273,
+      "tokens_start": 743339163,
+      "trained_at": "2026-05-08T05:02:12.054533+00:00"
+    },
+    {
+      "actual_tokens": 185763040,
+      "created_at": "2026-05-08T05:59:33.830981+00:00",
+      "deleted_at": "2026-05-08T06:13:01.578367+00:00",
+      "files": 3,
+      "id": 5,
+      "mode_docs": {
+        "fim_psm": 6562,
+        "fim_spm": 6425,
+        "standard": 118939
+      },
+      "mode_tokens": {
+        "fim_psm": 13248763,
+        "fim_spm": 12565935,
+        "standard": 159948342
+      },
+      "path": "datasets/cpt_shards/shard_00005",
+      "source_stats": {
+        "arxiv_cs_abstracts": {
+          "actual_tokens": 5000192,
+          "documents": 24141,
+          "examples_consumed": 24143,
+          "offset": 144533,
+          "stream_retries": 0,
+          "target_tokens": 5000000
+        },
+        "codeparrot_clean": {
+          "actual_tokens": 60000980,
+          "documents": 20612,
+          "examples_consumed": 20612,
+          "offset": 124904,
+          "stream_retries": 0,
+          "target_tokens": 60000000
+        },
+        "cosmopedia_replay": {
+          "actual_tokens": 10000577,
+          "documents": 13852,
+          "examples_consumed": 13852,
+          "offset": 83372,
+          "stream_retries": 0,
+          "target_tokens": 10000000
+        },
+        "github_issue_pr_sample": {
+          "actual_tokens": 752112,
+          "documents": 92,
+          "examples_consumed": 99,
+          "offset": 595,
+          "stream_retries": 0,
+          "target_tokens": 5000000
+        },
+        "github_issues": {
+          "actual_tokens": 0,
+          "documents": 0,
+          "examples_consumed": 30982954,
+          "offset": 185897725,
+          "stream_retries": 0,
+          "target_tokens": 10000000
+        },
+        "stackexchange_stackoverflow": {
+          "actual_tokens": 10000384,
+          "documents": 12830,
+          "examples_consumed": 12834,
+          "offset": 66572,
+          "stream_retries": 0,
+          "target_tokens": 10000000
+        },
+        "starcoder_c": {
+          "actual_tokens": 2501486,
+          "documents": 822,
+          "examples_consumed": 822,
+          "offset": 5653,
+          "stream_retries": 0,
+          "target_tokens": 2500000
+        },
+        "starcoder_go": {
+          "actual_tokens": 2500060,
+          "documents": 1302,
+          "examples_consumed": 1302,
+          "offset": 7853,
+          "stream_retries": 0,
+          "target_tokens": 2500000
+        },
+        "starcoder_javascript": {
+          "actual_tokens": 2500227,
+          "documents": 2143,
+          "examples_consumed": 2148,
+          "offset": 13741,
+          "stream_retries": 0,
+          "target_tokens": 2500000
+        },
+        "starcoder_python": {
+          "actual_tokens": 60002689,
+          "documents": 41662,
+          "examples_consumed": 41875,
+          "offset": 259653,
+          "stream_retries": 0,
+          "target_tokens": 60000000
+        },
+        "starcoder_rust": {
+          "actual_tokens": 2502026,
+          "documents": 1069,
+          "examples_consumed": 1075,
+          "offset": 7419,
+          "stream_retries": 0,
+          "target_tokens": 2500000
+        },
+        "the_stack_jupyter_notebooks": {
+          "actual_tokens": 30002307,
+          "documents": 13401,
+          "examples_consumed": 14354,
+          "offset": 87187,
+          "stream_retries": 0,
+          "target_tokens": 30000000
+        }
+      },
+      "status": "deleted",
+      "target_tokens": 200000000,
+      "tokens_end": 1114882313,
+      "tokens_start": 929119273,
+      "trained_at": "2026-05-08T06:13:01.518904+00:00"
+    },
+    {
+      "actual_tokens": 185839779,
+      "created_at": "2026-05-08T07:07:14.309016+00:00",
+      "deleted_at": "2026-05-08T07:20:43.473292+00:00",
+      "files": 3,
+      "id": 6,
+      "mode_docs": {
+        "fim_psm": 7018,
+        "fim_spm": 6981,
+        "standard": 115971
+      },
+      "mode_tokens": {
+        "fim_psm": 14481645,
+        "fim_spm": 14504735,
+        "standard": 156853399
+      },
+      "path": "datasets/cpt_shards/shard_00006",
+      "source_stats": {
+        "arxiv_cs_abstracts": {
+          "actual_tokens": 5000212,
+          "documents": 24001,
+          "examples_consumed": 24004,
+          "offset": 168537,
+          "stream_retries": 0,
+          "target_tokens": 5000000
+        },
+        "codeparrot_clean": {
+          "actual_tokens": 60019630,
+          "documents": 21914,
+          "examples_consumed": 21914,
+          "offset": 146818,
+          "stream_retries": 0,
+          "target_tokens": 60000000
+        },
+        "cosmopedia_replay": {
+          "actual_tokens": 10000612,
+          "documents": 13892,
+          "examples_consumed": 13892,
+          "offset": 97264,
+          "stream_retries": 0,
+          "target_tokens": 10000000
+        },
+        "github_issue_pr_sample": {
+          "actual_tokens": 752200,
+          "documents": 92,
+          "examples_consumed": 99,
+          "offset": 694,
+          "stream_retries": 0,
+          "target_tokens": 5000000
+        },
+        "github_issues": {
+          "actual_tokens": 0,
+          "documents": 0,
+          "examples_consumed": 30982954,
+          "offset": 216880679,
+          "stream_retries": 0,
+          "target_tokens": 10000000
+        },
+        "stackexchange_stackoverflow": {
+          "actual_tokens": 10000338,
+          "documents": 11534,
+          "examples_consumed": 11538,
+          "offset": 78110,
+          "stream_retries": 0,
+          "target_tokens": 10000000
+        },
+        "starcoder_c": {
+          "actual_tokens": 2511653,
+          "documents": 590,
+          "examples_consumed": 591,
+          "offset": 6244,
+          "stream_retries": 0,
+          "target_tokens": 2500000
+        },
+        "starcoder_go": {
+          "actual_tokens": 2548454,
+          "documents": 1245,
+          "examples_consumed": 1246,
+          "offset": 9099,
+          "stream_retries": 0,
+          "target_tokens": 2500000
+        },
+        "starcoder_javascript": {
+          "actual_tokens": 2501821,
+          "documents": 2372,
+          "examples_consumed": 2377,
+          "offset": 16118,
+          "stream_retries": 0,
+          "target_tokens": 2500000
+        },
+        "starcoder_python": {
+          "actual_tokens": 60000370,
+          "documents": 39847,
+          "examples_consumed": 40034,
+          "offset": 299687,
+          "stream_retries": 0,
+          "target_tokens": 60000000
+        },
+        "starcoder_rust": {
+          "actual_tokens": 2503457,
+          "documents": 1362,
+          "examples_consumed": 1367,
+          "offset": 8786,
+          "stream_retries": 0,
+          "target_tokens": 2500000
+        },
+        "the_stack_jupyter_notebooks": {
+          "actual_tokens": 30001032,
+          "documents": 13121,
+          "examples_consumed": 13994,
+          "offset": 101181,
+          "stream_retries": 0,
+          "target_tokens": 30000000
+        }
+      },
+      "status": "deleted",
+      "target_tokens": 200000000,
+      "tokens_end": 1300722092,
+      "tokens_start": 1114882313,
+      "trained_at": "2026-05-08T07:20:43.413921+00:00"
+    },
+    {
+      "actual_tokens": 185798475,
+      "created_at": "2026-05-08T08:18:04.650804+00:00",
+      "deleted_at": "2026-05-08T08:31:36.116474+00:00",
+      "files": 3,
+      "id": 7,
+      "mode_docs": {
+        "fim_psm": 7266,
+        "fim_spm": 7278,
+        "standard": 115847
+      },
+      "mode_tokens": {
+        "fim_psm": 13917871,
+        "fim_spm": 15933193,
+        "standard": 155947411
+      },
+      "path": "datasets/cpt_shards/shard_00007",
+      "source_stats": {
+        "arxiv_cs_abstracts": {
+          "actual_tokens": 5000290,
+          "documents": 24046,
+          "examples_consumed": 24048,
+          "offset": 192585,
+          "stream_retries": 0,
+          "target_tokens": 5000000
+        },
+        "codeparrot_clean": {
+          "actual_tokens": 60003085,
+          "documents": 20743,
+          "examples_consumed": 20743,
+          "offset": 167561,
+          "stream_retries": 0,
+          "target_tokens": 60000000
+        },
+        "cosmopedia_replay": {
+          "actual_tokens": 10000899,
+          "documents": 13915,
+          "examples_consumed": 13915,
+          "offset": 111179,
+          "stream_retries": 0,
+          "target_tokens": 10000000
+        },
+        "github_issue_pr_sample": {
+          "actual_tokens": 757291,
+          "documents": 92,
+          "examples_consumed": 99,
+          "offset": 793,
+          "stream_retries": 0,
+          "target_tokens": 5000000
+        },
+        "github_issues": {
+          "actual_tokens": 0,
+          "documents": 0,
+          "examples_consumed": 30982954,
+          "offset": 247863633,
+          "stream_retries": 0,
+          "target_tokens": 10000000
+        },
+        "stackexchange_stackoverflow": {
+          "actual_tokens": 10000115,
+          "documents": 11682,
+          "examples_consumed": 11685,
+          "offset": 89795,
+          "stream_retries": 0,
+          "target_tokens": 10000000
+        },
+        "starcoder_c": {
+          "actual_tokens": 2510277,
+          "documents": 939,
+          "examples_consumed": 940,
+          "offset": 7184,
+          "stream_retries": 0,
+          "target_tokens": 2500000
+        },
+        "starcoder_go": {
+          "actual_tokens": 2509583,
+          "documents": 1054,
+          "examples_consumed": 1054,
+          "offset": 10153,
+          "stream_retries": 0,
+          "target_tokens": 2500000
+        },
+        "starcoder_javascript": {
+          "actual_tokens": 2500117,
+          "documents": 2717,
+          "examples_consumed": 2726,
+          "offset": 18844,
+          "stream_retries": 0,
+          "target_tokens": 2500000
+        },
+        "starcoder_python": {
+          "actual_tokens": 60000471,
+          "documents": 41648,
+          "examples_consumed": 41848,
+          "offset": 341535,
+          "stream_retries": 0,
+          "target_tokens": 60000000
+        },
+        "starcoder_rust": {
+          "actual_tokens": 2515643,
+          "documents": 1221,
+          "examples_consumed": 1224,
+          "offset": 10010,
+          "stream_retries": 0,
+          "target_tokens": 2500000
+        },
+        "the_stack_jupyter_notebooks": {
+          "actual_tokens": 30000704,
+          "documents": 12334,
+          "examples_consumed": 13173,
+          "offset": 114354,
+          "stream_retries": 0,
+          "target_tokens": 30000000
+        }
+      },
+      "status": "deleted",
+      "target_tokens": 200000000,
+      "tokens_end": 1486520567,
+      "tokens_start": 1300722092,
+      "trained_at": "2026-05-08T08:31:36.051352+00:00"
+    }
+  ],
+  "source_offsets": {
+    "arxiv_cs_abstracts": 192585,
+    "codeparrot_clean": 167561,
+    "cosmopedia_replay": 111179,
+    "github_issue_pr_sample": 793,
+    "github_issues": 247863633,
+    "stackexchange_stackoverflow": 89795,
+    "starcoder_c": 7184,
+    "starcoder_go": 10153,
+    "starcoder_javascript": 18844,
+    "starcoder_python": 341535,
+    "starcoder_rust": 10010,
+    "the_stack_jupyter_notebooks": 114354
+  },
+  "tokens_prepared": 1486520567,
+  "tokens_trained": 185597952,
+  "updated_at": "2026-05-08T08:31:36.117031+00:00",
+  "version": 1
+}

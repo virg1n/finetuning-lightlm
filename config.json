@@ -13,7 +13,7 @@
     "base_checkpoint": "Virg1n/LightLM",
     "base_checkpoint_subfolder": "Model MoE 2+1",
     "tokenizer_name": "HuggingFaceTB/SmolLM-360M",
-    "resume_checkpoint": "latest",
+    "resume_checkpoint": "cpt_runs/lightlm-python-cpt/checkpoints/cpt_step_00000177.pt",
     "variant": "moe_2_plus_1",
     "num_dims": 384,
     "num_heads": 16,
@@ -95,12 +95,17 @@
     "checkpoint_interval_steps": 1000,
     "max_checkpoints_to_keep": 2,
     "log_interval_steps": 10,
+    "parallel_shard_building": true,
+    "prefetch_shards": 2,
+    "shard_producer_poll_seconds": 15,
     "delete_shard_after_train": true
   },
   "evaluation": {
     "bigcode_harness": {
       "enabled": true,
       "interval_tokens": 2000000000,
+      "metric_output_path": "{output_dir}/eval_results_step_{step}.json",
+      "stdout_log_file": "{output_dir}/logs/eval_stdout_step_{step}.log",
       "command": [
         "accelerate",
         "launch",
@@ -125,9 +130,8 @@
         "--batch_size",
         "16",
         "--allow_code_execution",
-        "--save_generations",
-        "--save_generations_path",
-        "{output_dir}/eval_generations_step_{step}.json"
+        "--metric_output_path",
+        "{metric_output_path}"
       ],
       "cwd": "../bigcode-evaluation-harness",
       "eval_model": "{output_dir}"
@@ -140,6 +144,7 @@
     "stream_retry_initial_seconds": 5.0,
     "stream_retry_max_seconds": 120.0,
     "min_doc_chars": 32,
+    "max_empty_examples_per_source": 500000,
     "english_filter": {
       "enabled": true,
       "min_ascii_ratio": 0.85,
@@ -267,7 +272,9 @@
         "data_dir": "github-issues-filtered-structured",
         "split": "train",
         "weight": 2.0,
-        "text_field": ["title", "body", "comments"],
+        "text_field": "content",
+        "content_processor": "github_issue_conversation",
+        "reset_offset_if_zero_tokens": true,
         "english_only": true,
         "requires_hf_access": true
       },
