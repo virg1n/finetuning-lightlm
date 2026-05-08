@@ -1596,7 +1596,7 @@ def export_eval_model(config: Dict[str, Any], tokenizer: Any, model: torch.nn.Mo
         "rmsnorm_eps": model_cfg["rmsnorm_eps"],
         "rope_theta": model_cfg["rope_theta"],
         "context_len": model_cfg["context_len"],
-        "use_cache": False,
+        "use_cache": True,
         "use_flash": model_cfg["use_flash"],
         "use_moe": model_cfg["use_moe"],
         "moe_num_experts": model_cfg["moe_num_experts"],

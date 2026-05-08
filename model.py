@@ -12,7 +12,7 @@ import os
 from contextlib import nullcontext
 from dataclasses import dataclass
 from huggingface_hub import PyTorchModelHubMixin
-from typing import Optional
+from typing import List, Optional, Tuple
 
 from torch.distributed import init_process_group, destroy_process_group
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -95,7 +95,7 @@ class Rotary(nn.Module):
         self.cos_saved = None
         self.sin_saved = None
 
-    def forward(self, x, seq_dim=1, positions=None):
+    def forward(self, x, seq_dim=1, positions=None, start_pos=0):
         seq_len = x.size(seq_dim)
         if positions is not None:
             freqs = torch.einsum("bt,j->btj", positions.to(self.inv_freq.dtype), self.inv_freq)
@@ -103,7 +103,7 @@ class Rotary(nn.Module):
             return emb.cos().unsqueeze(1), emb.sin().unsqueeze(1)
 
         # Only recompute the cosine and sine matrices if the sequence length has changed.
-        if seq_len != self.seq_len_saved:
+        if start_pos == 0 and seq_len != self.seq_len_saved:
             self.seq_len_saved = seq_len
             pos = torch.arange(seq_len, device=x.device, dtype=self.inv_freq.dtype)
             # Compute the outer product between positions and inverse frequencies.
@@ -112,6 +112,11 @@ class Rotary(nn.Module):
             emb = torch.cat((freqs, freqs), dim=-1)
             self.cos_saved = emb.cos()
             self.sin_saved = emb.sin()
+        elif start_pos != 0:
+            pos = torch.arange(start_pos, start_pos + seq_len, device=x.device, dtype=self.inv_freq.dtype)
+            freqs = torch.einsum("i,j->ij", pos, self.inv_freq)
+            emb = torch.cat((freqs, freqs), dim=-1)
+            return emb.cos(), emb.sin()
 
         return self.cos_saved, self.sin_saved
 
@@ -197,9 +202,8 @@ class GroupedQueryAttention(nn.Module):
         ).tril()
         return (same_doc & causal).unsqueeze(1)
 
-    def sdpa_attention(self, queries, keys, values, attention_mask):
+    def sdpa_attention(self, queries, keys, values, attention_mask, is_causal):
         enable_gqa = self.num_heads != self.num_kv_heads
-        is_causal = attention_mask is None
         if (
             SDPBackend is not None
             and queries.is_cuda
@@ -226,81 +230,63 @@ class GroupedQueryAttention(nn.Module):
             enable_gqa=enable_gqa,
         )
 
-    def forward(self, x, cos, sin, start_pos = 0, positions=None):
+    def forward(
+        self,
+        x,
+        cos,
+        sin,
+        start_pos=0,
+        positions=None,
+        past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        use_cache: bool = False,
+    ):
         c_batch_size, c_context_len, c_dim = x.shape # c_context_len = 1
 
-        if self.use_cache and c_context_len == 1:
-            # Cache branch
-            q = self.wq(x[:, -1, :])
-            k = self.wk(x[:, -1, :])
-            v = self.wv(x[:, -1, :])
-    
-            q = q.view(c_batch_size, c_context_len, self.num_heads, self.head_dim).transpose(1, 2)      # B, T, qh, hs
-            k = k.view(c_batch_size, c_context_len, self.num_kv_heads, self.head_dim).transpose(1, 2)   # B, T, kh, hs
-            v = v.view(c_batch_size, c_context_len, self.num_kv_heads, self.head_dim).transpose(1, 2)   # B, T, vh, hs
+        q = self.wq(x)
+        k = self.wk(x)
+        v = self.wv(x)
 
-            # freqs_complex = freqs_complex[-1:]
-            # queries = apply_rotary_pos(q, freqs_complex, device=x.device)
-            # keys = apply_rotary_pos(k, freqs_complex, device=x.device)
+        q = q.view(c_batch_size, c_context_len, self.num_heads, self.head_dim).transpose(1, 2)      # B, qh, T, hs
+        k = k.view(c_batch_size, c_context_len, self.num_kv_heads, self.head_dim).transpose(1, 2)   # B, kh, T, hs
+        v = v.view(c_batch_size, c_context_len, self.num_kv_heads, self.head_dim).transpose(1, 2)   # B, vh, T, hs
 
-            keys, v = self.update_kv_cache(batch_size=c_batch_size, start_pos=start_pos, context_len=c_context_len, keys=keys, values=v, device=x.device)
-            queries, keys = self.apply_rotary_pos(q, k, cos, sin)
-            
-        else:
-            # Non-cache branch (process the entire sequence normally)
-            q = self.wq(x)
-            k = self.wk(x)
-            v = self.wv(x)
-    
-            q = q.view(c_batch_size, c_context_len, self.num_heads, self.head_dim).transpose(1, 2)      # B, qh, T, hs
-            k = k.view(c_batch_size, c_context_len, self.num_kv_heads, self.head_dim).transpose(1, 2)   # B, kh, T, hs
-            v = v.view(c_batch_size, c_context_len, self.num_kv_heads, self.head_dim).transpose(1, 2)   # B, vh, T, hs
-
-            queries, keys = self.apply_rotary_pos(q, k, cos, sin)
-    
-            # queries = apply_rotary_pos(q, freqs_complex, device=x.device)
-            # keys = apply_rotary_pos(k, freqs_complex, device=x.device)
-
-            if self.use_cache: _k, _v = self.update_kv_cache(batch_size=c_batch_size, start_pos=start_pos, context_len=c_context_len, keys=keys, values=v, device=x.device)
+        queries, keys = self.apply_rotary_pos(q, k, cos, sin)
+        past_len = 0
+        if past_key_value is not None:
+            past_keys, past_values = past_key_value
+            past_len = past_keys.size(2)
+            keys = torch.cat((past_keys, keys), dim=2)
+            v = torch.cat((past_values, v), dim=2)
+        present_key_value = (keys, v) if use_cache else None
         
         attention_mask = self.build_document_causal_mask(positions) if positions is not None else None
+        is_causal = attention_mask is None and past_len == 0
 
         if self.use_flash:
-            output = self.sdpa_attention(queries, keys, v, attention_mask)
+            output = self.sdpa_attention(queries, keys, v, attention_mask, is_causal)
             
         else: # Calculate Grouped Query Attention manually
-            keys = repeat_kv(keys, self.num_rep)
-            values = repeat_kv(v, self.num_rep)
+            keys = keys.repeat_interleave(self.num_rep, dim=1)
+            values = v.repeat_interleave(self.num_rep, dim=1)
     
             attention = torch.matmul(queries, keys.transpose(-2, -1)) * (1.0 / math.sqrt(self.head_dim))
     
-            if self.use_cache and x.shape[1] == 1:
-                total_length = keys.size(2)
-                # For autoregressive generation, the query (which is at the latest position) should only attend to keys at indices <= current token.
-                # Create a mask: allowed positions are indices < total_length (i.e. all in the cache) 
-                mask = torch.arange(total_length, device=attention.device).unsqueeze(0) <= (start_pos + x.shape[1] - 1)
-                mask = mask.unsqueeze(0).unsqueeze(0)  # shape: (1, 1, 1, total_length)
-                attention = attention.masked_fill(~mask, float("-inf"))
-                attention = F.softmax(attention, dim=-1)
-                output = torch.matmul(attention, values)
-
-            else: # Do not use kv_cache
-                if attention_mask is None:
-                    causal = torch.ones(
-                        c_context_len,
-                        c_context_len,
-                        device=attention.device,
-                        dtype=torch.bool,
-                    ).tril()
-                    attention = attention.masked_fill(~causal, float("-inf"))
-                else:
-                    attention = attention.masked_fill(~attention_mask, float("-inf"))
+            if attention_mask is None and past_len == 0:
+                causal = torch.ones(
+                    c_context_len,
+                    c_context_len,
+                    device=attention.device,
+                    dtype=torch.bool,
+                ).tril()
+                attention = attention.masked_fill(~causal, float("-inf"))
+            elif attention_mask is not None:
+                attention = attention.masked_fill(~attention_mask, float("-inf"))
         
-                attention = F.softmax(attention, dim=-1).type_as(queries)
-                output = torch.matmul(attention, values)
+            attention = F.softmax(attention, dim=-1).type_as(queries)
+            output = torch.matmul(attention, values)
 
         output = output.transpose(2, 1).contiguous().view(c_batch_size, c_context_len, c_dim)
-        return self.wo(output)
+        return self.wo(output), present_key_value
 
 
 class FeedForward(nn.Module):
@@ -455,17 +441,27 @@ class Block(nn.Module):
         self.norm_attention = torch.nn.modules.normalization.RMSNorm(config.num_dims, config.rmsnorm_eps) # you also can use RMSNorm(config)
         self.norm_ffn = torch.nn.modules.normalization.RMSNorm(config.num_dims, config.rmsnorm_eps) # you also can use RMSNorm(config)
 
-    def forward(self, x, cos, sin, start_pos, positions=None):
-        x = x + self.attention(
+    def forward(
+        self,
+        x,
+        cos,
+        sin,
+        start_pos,
+        positions=None,
+        past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        use_cache: bool = False,
+    ):
+        attention_out, present_key_value = self.attention(
             self.norm_attention(x), 
-            cos, sin, start_pos, positions
-            )
+            cos, sin, start_pos, positions, past_key_value, use_cache
+        )
+        x = x + attention_out
         
         ffn_out, aux_loss = self.ffn(
             self.norm_ffn(x)
             )
         x = x + ffn_out
-        return x, aux_loss
+        return x, aux_loss, present_key_value
     
 
 class Transformer(nn.Module, PyTorchModelHubMixin): # extending PyTorchModelHubMixin for save weights as safetensors
@@ -518,20 +514,37 @@ class Transformer(nn.Module, PyTorchModelHubMixin): # extending PyTorchModelHubM
         start_pos: int = 0,
         positions: Optional[torch.Tensor] = None,
         return_hidden: bool = False,
+        past_key_values: Optional[Tuple[Tuple[torch.Tensor, torch.Tensor], ...]] = None,
+        use_cache: bool = False,
     ):
         _, seq_len = x.shape
+        if past_key_values is None:
+            past_key_values = tuple([None] * len(self.blocks))  # type: ignore[list-item]
+        if past_key_values and past_key_values[0] is not None:
+            start_pos = past_key_values[0][0].size(2)
         
         x = self.tokens_embedding(x)
-        cos, sin = self.rotary_emb(x, seq_dim=1, positions=positions)
+        cos, sin = self.rotary_emb(x, seq_dim=1, positions=positions, start_pos=start_pos)
         
         # if self.freqs_complex == None:
         #     self.freqs_complex = precompute_theta_pos_frequencies(self.num_dims // self.num_heads, self.context_len * 2, device=x.device)
         # freqs_complex = self.freqs_complex[start_pos:start_pos + seq_len]
         
         total_aux_loss = 0
+        present_key_values: List[Tuple[torch.Tensor, torch.Tensor]] = []
 
-        for block in self.blocks:
-            x, aux_loss = block(x, cos, sin, start_pos=start_pos, positions=positions)
+        for block, past_key_value in zip(self.blocks, past_key_values):
+            x, aux_loss, present_key_value = block(
+                x,
+                cos,
+                sin,
+                start_pos=start_pos,
+                positions=positions,
+                past_key_value=past_key_value,
+                use_cache=use_cache,
+            )
+            if use_cache:
+                present_key_values.append(present_key_value)
             if self.use_moe and not self.use_lossfreebalance:
                 total_aux_loss += aux_loss
         
@@ -557,6 +570,8 @@ class Transformer(nn.Module, PyTorchModelHubMixin): # extending PyTorchModelHubM
                 loss = ce_loss
                 ce_loss = aux_loss
 
+        if use_cache:
+            return logits, loss, ce_loss, tuple(present_key_values)
         return logits, loss, ce_loss
 
     @torch.no_grad()
@@ -565,12 +580,15 @@ class Transformer(nn.Module, PyTorchModelHubMixin): # extending PyTorchModelHubM
         """
         Generate text from x up to max_tokens
         """
+        past_key_values = None
         for c_tkn_pos in range(max_tokens):
             if use_cache:
-                if c_tkn_pos == 0:
-                    logits, _, ce_loss = self.forward(x, start_pos=c_tkn_pos)
-                else:
-                    logits, _, ce_loss = self.forward(x[:, -1:], start_pos=c_tkn_pos)
+                model_input = x if past_key_values is None else x[:, -1:]
+                logits, _, ce_loss, past_key_values = self.forward(
+                    model_input,
+                    past_key_values=past_key_values,
+                    use_cache=True,
+                )
             else:
                 logits, _, ce_loss = self.forward(x)
 

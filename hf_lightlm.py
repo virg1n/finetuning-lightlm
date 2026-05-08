@@ -68,7 +68,7 @@ class LightLMConfig(PretrainedConfig):
             rmsnorm_eps=self.rmsnorm_eps,
             rope_theta=self.rope_theta,
             context_len=self.context_len,
-            use_cache=False,
+            use_cache=self.use_cache,
             use_flash=self.use_flash,
             use_moe=self.use_moe,
             moe_num_experts=self.moe_num_experts,
@@ -112,18 +112,43 @@ class LightLMForCausalLM(PreTrainedModel, GenerationMixin):
         self.lightlm.tokens_embedding.weight = self.lightlm.ll_head.weight
         self.all_tied_weights_keys = {key: key for key in self._tied_weights_keys}
 
-    def prepare_inputs_for_generation(self, input_ids, **kwargs):
-        return {"input_ids": input_ids}
+    def prepare_inputs_for_generation(self, input_ids, past_key_values=None, attention_mask=None, **kwargs):
+        if past_key_values is not None:
+            input_ids = input_ids[:, -1:]
+        return {
+            "input_ids": input_ids,
+            "past_key_values": past_key_values,
+            "attention_mask": attention_mask,
+            "use_cache": kwargs.get("use_cache", True),
+        }
 
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         labels: Optional[torch.LongTensor] = None,
+        past_key_values=None,
+        use_cache: Optional[bool] = None,
         **kwargs,
     ):
         del attention_mask, kwargs
-        logits, _, _ = self.lightlm(input_ids, targets=None)
+        if use_cache is None:
+            use_cache = bool(self.config.use_cache)
+        if labels is not None:
+            use_cache = False
+
+        outputs = self.lightlm(
+            input_ids,
+            targets=None,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+        )
+        if use_cache:
+            logits, _, _, present_key_values = outputs
+        else:
+            logits, _, _ = outputs
+            present_key_values = None
+
         loss = None
         if labels is not None:
             shift_logits = logits[..., :-1, :].contiguous()
@@ -133,4 +158,4 @@ class LightLMForCausalLM(PreTrainedModel, GenerationMixin):
                 shift_labels.view(-1),
                 ignore_index=-100,
             )
-        return CausalLMOutputWithPast(loss=loss, logits=logits)
+        return CausalLMOutputWithPast(loss=loss, logits=logits, past_key_values=present_key_values)
