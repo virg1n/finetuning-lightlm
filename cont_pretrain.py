@@ -1641,6 +1641,27 @@ def eval_format_values(
     }
 
 
+def clean_subprocess_distributed_env(env: Dict[str, str]) -> Dict[str, str]:
+    cleaned = env.copy()
+    for key in (
+        "RANK",
+        "LOCAL_RANK",
+        "WORLD_SIZE",
+        "GROUP_RANK",
+        "ROLE_RANK",
+        "LOCAL_WORLD_SIZE",
+        "MASTER_ADDR",
+        "MASTER_PORT",
+        "TORCHELASTIC_ERROR_FILE",
+        "TORCHELASTIC_RESTART_COUNT",
+        "TORCHELASTIC_MAX_RESTARTS",
+        "TORCHELASTIC_RUN_ID",
+        "TORCHELASTIC_USE_AGENT_STORE",
+    ):
+        cleaned.pop(key, None)
+    return cleaned
+
+
 def compact_eval_results(path: Path) -> Optional[Any]:
     if not path.exists():
         return None
@@ -1731,8 +1752,9 @@ def run_bigcode_eval(
         return False
     stdout_path = Path(stdout_log_file)
     stdout_path.parent.mkdir(parents=True, exist_ok=True)
+    env = clean_subprocess_distributed_env(os.environ)
     with stdout_path.open("w", encoding="utf-8") as f:
-        result = subprocess.run(command, cwd=cwd, stdout=f, stderr=subprocess.STDOUT, text=True, check=False)
+        result = subprocess.run(command, cwd=cwd, env=env, stdout=f, stderr=subprocess.STDOUT, text=True, check=False)
     eval_results = compact_eval_results(Path(metric_output_path))
     append_jsonl(
         log_path,
