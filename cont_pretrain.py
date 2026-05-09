@@ -80,6 +80,7 @@ KNOWN_GATED_HF_DATASETS = {
 
 _DIST_RUN_ID = "single"
 _RANK0_STAGE_COUNTER = 0
+_JSONL_MAX_BYTES = int(os.environ.get("LIGHTLM_JSONL_MAX_BYTES", str(1024 * 1024)))
 
 if os.name == "nt":
     import msvcrt
@@ -105,10 +106,31 @@ def write_json(path: Path, data: Dict[str, Any]) -> None:
     tmp.replace(path)
 
 
+def configure_logging(config: Dict[str, Any]) -> None:
+    global _JSONL_MAX_BYTES
+    _JSONL_MAX_BYTES = int(config.get("logging", {}).get("jsonl_max_bytes", _JSONL_MAX_BYTES))
+
+
+def truncate_file_tail(path: Path, max_bytes: int) -> None:
+    if max_bytes <= 0 or not path.exists() or path.stat().st_size <= max_bytes:
+        return
+    with path.open("rb") as f:
+        f.seek(-max_bytes, os.SEEK_END)
+        data = f.read()
+    newline = data.find(b"\n")
+    if newline != -1:
+        data = data[newline + 1 :]
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with tmp.open("wb") as f:
+        f.write(data)
+    tmp.replace(path)
+
+
 def append_jsonl(path: Path, row: Dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as f:
         f.write(json.dumps(row, sort_keys=True) + "\n")
+    truncate_file_tail(path, _JSONL_MAX_BYTES)
 
 
 @contextmanager
@@ -1662,6 +1684,47 @@ def clean_subprocess_distributed_env(env: Dict[str, str]) -> Dict[str, str]:
     return cleaned
 
 
+def run_subprocess_with_bounded_output(
+    command: List[str],
+    cwd: Optional[str],
+    env: Dict[str, str],
+    stdout_path: Optional[Path],
+    mode: str,
+    max_bytes: int,
+) -> int:
+    if mode == "full" and stdout_path is not None:
+        stdout_path.parent.mkdir(parents=True, exist_ok=True)
+        with stdout_path.open("wb") as f:
+            result = subprocess.run(command, cwd=cwd, env=env, stdout=f, stderr=subprocess.STDOUT, check=False)
+        truncate_file_tail(stdout_path, max_bytes)
+        return result.returncode
+
+    if mode == "discard":
+        with open(os.devnull, "wb") as f:
+            result = subprocess.run(command, cwd=cwd, env=env, stdout=f, stderr=subprocess.STDOUT, check=False)
+        return result.returncode
+
+    tail = bytearray()
+    process = subprocess.Popen(
+        command,
+        cwd=cwd,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+    assert process.stdout is not None
+    for chunk in iter(lambda: process.stdout.read(64 * 1024), b""):
+        tail.extend(chunk)
+        if max_bytes > 0 and len(tail) > max_bytes:
+            del tail[: len(tail) - max_bytes]
+    returncode = process.wait()
+    if stdout_path is not None and tail:
+        stdout_path.parent.mkdir(parents=True, exist_ok=True)
+        with stdout_path.open("wb") as f:
+            f.write(tail)
+    return returncode
+
+
 def compact_eval_results(path: Path) -> Optional[Any]:
     if not path.exists():
         return None
@@ -1706,6 +1769,12 @@ def run_bigcode_eval(
         "stdout_log_file",
         "{output_dir}/logs/eval_stdout_step_{step}.log",
     ).format(**base_format_values)
+    stdout_log_mode = str(eval_cfg.get("stdout_log_mode", "tail")).lower()
+    stdout_log_max_bytes = int(eval_cfg.get("stdout_log_max_bytes", 64 * 1024))
+    if stdout_log_mode not in {"tail", "discard", "full"}:
+        stdout_log_mode = "tail"
+    if stdout_log_mode == "discard":
+        stdout_log_file = ""
     format_values = eval_format_values(
         output_dir,
         global_step,
@@ -1750,11 +1819,16 @@ def run_bigcode_eval(
             },
         )
         return False
-    stdout_path = Path(stdout_log_file)
-    stdout_path.parent.mkdir(parents=True, exist_ok=True)
+    stdout_path = Path(stdout_log_file) if stdout_log_file else None
     env = clean_subprocess_distributed_env(os.environ)
-    with stdout_path.open("w", encoding="utf-8") as f:
-        result = subprocess.run(command, cwd=cwd, env=env, stdout=f, stderr=subprocess.STDOUT, text=True, check=False)
+    returncode = run_subprocess_with_bounded_output(
+        command,
+        cwd,
+        env,
+        stdout_path,
+        stdout_log_mode,
+        stdout_log_max_bytes,
+    )
     eval_results = compact_eval_results(Path(metric_output_path))
     append_jsonl(
         log_path,
@@ -1762,14 +1836,15 @@ def run_bigcode_eval(
             "event": "bigcode_eval_end",
             "step": global_step,
             "tokens_trained": tokens_trained,
-            "returncode": result.returncode,
-            "results": eval_results,
+            "returncode": returncode,
+            "result_keys": sorted(eval_results.keys()) if isinstance(eval_results, dict) else None,
             "metric_output_path": metric_output_path,
             "stdout_log_file": stdout_log_file,
+            "stdout_log_mode": stdout_log_mode,
             "time": utc_now(),
         },
     )
-    if result.returncode != 0:
+    if returncode != 0:
         return False
     interval = int(eval_cfg["interval_tokens"])
     if force and next_eval <= tokens_trained:
@@ -1997,15 +2072,15 @@ def shard_producer_loop(config: Dict[str, Any], tokenizer: Any, token_size: int)
 
 
 def start_shard_producer(config: Dict[str, Any], config_path: str) -> subprocess.Popen:
-    log_path = shard_producer_log_path(config)
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    env = os.environ.copy()
-    for key in ("RANK", "LOCAL_RANK", "WORLD_SIZE", "GROUP_RANK", "ROLE_RANK", "LOCAL_WORLD_SIZE"):
-        env.pop(key, None)
+    log_enabled = bool(config["training"].get("shard_producer_log_enabled", False))
+    log_path = shard_producer_log_path(config) if log_enabled else None
+    if log_path is not None:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+    env = clean_subprocess_distributed_env(os.environ)
     env["CUDA_VISIBLE_DEVICES"] = ""
     env["PYTHONUNBUFFERED"] = "1"
     command = [sys.executable, str(Path(__file__).resolve()), "--config", config_path, "--shard-producer"]
-    log_file = log_path.open("ab", buffering=0)
+    log_file = log_path.open("ab", buffering=0) if log_path is not None else open(os.devnull, "ab", buffering=0)
     process = subprocess.Popen(
         command,
         cwd=str(Path.cwd()),
@@ -2014,7 +2089,7 @@ def start_shard_producer(config: Dict[str, Any], config_path: str) -> subprocess
         stderr=subprocess.STDOUT,
     )
     process._lightlm_log_file = log_file  # type: ignore[attr-defined]
-    log_rank0(f"Started shard producer pid={process.pid}; log={log_path}")
+    log_rank0(f"Started shard producer pid={process.pid}; log={log_path or 'discarded'}")
     return process
 
 
@@ -2073,6 +2148,7 @@ def main() -> None:
     args = parser.parse_args()
 
     config = read_json(Path(args.config))
+    configure_logging(config)
     if args.shard_producer:
         set_seed(int(config["seed"]), 0)
         tokenizer, _old_vocab_size = build_tokenizer(config)
