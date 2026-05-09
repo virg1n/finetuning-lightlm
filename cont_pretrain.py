@@ -844,10 +844,18 @@ def extract_python_notebook(text: str) -> str:
         notebook = json.loads(text)
     except json.JSONDecodeError:
         return text
+    if not isinstance(notebook, dict):
+        return ""
 
     metadata = notebook.get("metadata", {})
+    if not isinstance(metadata, dict):
+        metadata = {}
     language_info = metadata.get("language_info", {})
+    if not isinstance(language_info, dict):
+        language_info = {}
     kernelspec = metadata.get("kernelspec", {})
+    if not isinstance(kernelspec, dict):
+        kernelspec = {}
     language = normalize_language(
         language_info.get("name") or kernelspec.get("language") or kernelspec.get("name")
     )
@@ -855,12 +863,21 @@ def extract_python_notebook(text: str) -> str:
         return ""
 
     cells = []
-    for cell in notebook.get("cells", []):
+    raw_cells = notebook.get("cells", [])
+    if not isinstance(raw_cells, list):
+        return ""
+    for cell in raw_cells:
+        if not isinstance(cell, dict):
+            continue
         if cell.get("cell_type") != "code":
             continue
         source = cell.get("source", "")
+        if source is None:
+            continue
         if isinstance(source, list):
-            source = "".join(source)
+            source = "".join(flatten_text(part) for part in source if part is not None)
+        elif not isinstance(source, str):
+            source = flatten_text(source)
         if source.strip():
             cells.append(source)
     return "\n\n".join(cells)
