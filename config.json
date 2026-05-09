@@ -16,7 +16,7 @@
     "base_checkpoint": "Virg1n/LightLM",
     "base_checkpoint_subfolder": "Model MoE 2+1",
     "tokenizer_name": "HuggingFaceTB/SmolLM-360M",
-    "resume_checkpoint": "cpt_runs/lightlm-python-cpt/checkpoints/cpt_step_00000177.pt",
+    "resume_checkpoint": "latest",
     "variant": "moe_2_plus_1",
     "num_dims": 384,
     "num_heads": 16,

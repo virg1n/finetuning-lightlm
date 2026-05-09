@@ -2123,11 +2123,21 @@ def wait_for_produced_shard(
         if producer is not None:
             returncode = producer.poll()
             if returncode is not None:
-                log_path = shard_producer_log_path(config)
-                raise RuntimeError(
-                    f"Shard producer exited with code {returncode} before a shard was ready. "
-                    f"See {log_path}."
+                append_jsonl(
+                    Path(config["paths"]["train_log_file"]),
+                    {
+                        "event": "shard_producer_exited",
+                        "time": utc_now(),
+                        "returncode": returncode,
+                    },
                 )
+                if rank0():
+                    print(
+                        f"Shard producer exited with code {returncode}; "
+                        "building next shard synchronously.",
+                        flush=True,
+                    )
+                return None
         time.sleep(poll_seconds)
 
 
@@ -2251,11 +2261,20 @@ def main() -> None:
     try:
         while True:
             def prepare_or_mark_shard_stage() -> None:
+                nonlocal shard_producer
                 manifest = load_manifest(Path(config["paths"]["manifest_path"]))
                 shard = next_shard_to_train(manifest)
                 if shard is None and int(manifest["tokens_prepared"]) < int(config["tokens"]["target_total_tokens"]):
                     if config["training"].get("parallel_shard_building", True) and not args.prepare_only:
                         shard = wait_for_produced_shard(config, shard_producer)
+                        if (
+                            shard is None
+                            and shard_producer is not None
+                            and shard_producer.poll() is not None
+                        ):
+                            stop_shard_producer(shard_producer)
+                            shard_producer = None
+                            shard = build_next_shard(config, tokenizer, token_size)
                     else:
                         shard = build_next_shard(config, tokenizer, token_size)
                 if shard is not None and not args.prepare_only:
