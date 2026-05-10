@@ -110,7 +110,12 @@ def resolve_path(value: str, base: Path) -> Path:
     return (base / path).resolve()
 
 
-def export_checkpoint_model(config: Dict[str, Any], checkpoint: str, device_name: str) -> str:
+def export_checkpoint_model(
+    config: Dict[str, Any],
+    checkpoint: str,
+    device_name: str,
+    export_dir: Optional[Path] = None,
+) -> str:
     import torch
 
     from cont_pretrain import build_tokenizer_and_model, export_eval_model
@@ -127,7 +132,7 @@ def export_checkpoint_model(config: Dict[str, Any], checkpoint: str, device_name
     tokenizer, model, _ = build_tokenizer_and_model(export_config, device)
     model.eval()
     with torch.no_grad():
-        return export_eval_model(export_config, tokenizer, model)
+        return export_eval_model(export_config, tokenizer, model, export_dir=export_dir)
 
 
 def resolve_eval_model(args: argparse.Namespace, config: Dict[str, Any]) -> str:
@@ -138,6 +143,10 @@ def resolve_eval_model(args: argparse.Namespace, config: Dict[str, Any]) -> str:
     output_dir = resolve_path(config["paths"]["output_dir"], REPO_ROOT)
     exported_model = output_dir / "eval_model"
     checkpoint_dir = resolve_path(config["paths"]["checkpoint_dir"], REPO_ROOT)
+    if args.dry_run:
+        if args.export_dir:
+            return str(resolve_path(args.export_dir, Path.cwd()))
+        return str(exported_model.resolve())
 
     checkpoint = args.checkpoint
     if checkpoint == "auto":
@@ -162,8 +171,11 @@ def resolve_eval_model(args: argparse.Namespace, config: Dict[str, Any]) -> str:
             raise RuntimeError(f"Checkpoint not found: {checkpoint_path}")
         checkpoint = str(checkpoint_path)
 
+    export_dir = resolve_path(args.export_dir, Path.cwd()) if args.export_dir else None
     print(f"exporting eval model from checkpoint={checkpoint}")
-    return export_checkpoint_model(config, checkpoint, args.export_device)
+    if export_dir:
+        print(f"export_dir: {export_dir}")
+    return export_checkpoint_model(config, checkpoint, args.export_device, export_dir=export_dir)
 
 
 def build_command(
@@ -244,6 +256,11 @@ def main() -> int:
         help="'auto', 'latest', 'base', or a local cpt_step_*.pt path. Ignored when --model is set.",
     )
     parser.add_argument("--export-device", choices=("cpu", "cuda"), default="cpu")
+    parser.add_argument(
+        "--export-dir",
+        default=None,
+        help="Optional HF export directory for --checkpoint exports. Useful for comparing base vs trained models.",
+    )
     parser.add_argument("--harness-dir", default=None)
     parser.add_argument("--tasks", default=None)
     parser.add_argument("--precision", default=None)
@@ -299,7 +316,7 @@ def main() -> int:
     stdout_log_file.parent.mkdir(parents=True, exist_ok=True)
 
     command, harness_dir = build_command(args, config, eval_model, metric_output_path)
-    if not (harness_dir / "main.py").exists():
+    if not args.dry_run and not (harness_dir / "main.py").exists():
         raise RuntimeError(
             f"bigcode-evaluation-harness main.py not found in {harness_dir}. "
             "Clone it there or pass --harness-dir."

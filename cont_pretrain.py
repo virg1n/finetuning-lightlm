@@ -440,7 +440,7 @@ def model_config_from_json(config: Dict[str, Any], vocab_size: int) -> ModelConf
 def strip_state_prefixes(state: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
     out = {}
     for k, v in state.items():
-        for prefix in ("module.", "_orig_mod."):
+        for prefix in ("module.", "_orig_mod.", "lightlm."):
             if k.startswith(prefix):
                 k = k[len(prefix) :]
         out[k] = v
@@ -1598,8 +1598,16 @@ def load_resume_state(config: Dict[str, Any]) -> Dict[str, Any]:
     return checkpoint
 
 
-def export_eval_model(config: Dict[str, Any], tokenizer: Any, model: torch.nn.Module) -> str:
-    export_dir = Path(config["paths"]["output_dir"]) / "eval_model"
+def export_eval_model(
+    config: Dict[str, Any],
+    tokenizer: Any,
+    model: torch.nn.Module,
+    export_dir: Optional[Path] = None,
+) -> str:
+    if export_dir is None:
+        export_dir = Path(config["paths"]["output_dir"]) / "eval_model"
+    else:
+        export_dir = Path(export_dir)
     export_dir.mkdir(parents=True, exist_ok=True)
     tokenizer.save_pretrained(export_dir)
 
