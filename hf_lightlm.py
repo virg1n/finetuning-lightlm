@@ -12,6 +12,30 @@ except ImportError:
     from model import ModelConfig, Transformer
 
 
+def _past_key_values_length(past_key_values) -> int:
+    if past_key_values is None:
+        return 0
+    if hasattr(past_key_values, "get_seq_length"):
+        try:
+            return int(past_key_values.get_seq_length())
+        except TypeError:
+            return int(past_key_values.get_seq_length(0))
+        except Exception:
+            pass
+    try:
+        if len(past_key_values) == 0:
+            return 0
+    except TypeError:
+        return 0
+    first_layer = past_key_values[0] if len(past_key_values) else None
+    if first_layer is None:
+        return 0
+    try:
+        return int(first_layer[0].size(2))
+    except Exception:
+        return 0
+
+
 class LightLMConfig(PretrainedConfig):
     model_type = "lightlm"
 
@@ -114,8 +138,11 @@ class LightLMForCausalLM(PreTrainedModel, GenerationMixin):
         self.all_tied_weights_keys = {key: key for key in self._tied_weights_keys}
 
     def prepare_inputs_for_generation(self, input_ids, past_key_values=None, attention_mask=None, **kwargs):
-        if past_key_values is not None:
-            input_ids = input_ids[:, -1:]
+        past_length = _past_key_values_length(past_key_values)
+        if past_length > 0:
+            input_ids = input_ids[:, past_length:]
+            if input_ids.size(1) == 0:
+                input_ids = input_ids[:, -1:]
         return {
             "input_ids": input_ids,
             "past_key_values": past_key_values,
@@ -139,6 +166,9 @@ class LightLMForCausalLM(PreTrainedModel, GenerationMixin):
             use_cache = True
         if labels is not None:
             use_cache = False
+
+        if _past_key_values_length(past_key_values) == 0:
+            past_key_values = None
 
         outputs = self.lightlm(
             input_ids,
