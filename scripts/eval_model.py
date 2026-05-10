@@ -111,6 +111,40 @@ def safe_name(value: str) -> str:
     return cleaned[:120] or "eval"
 
 
+def task_names(tasks: str) -> List[str]:
+    return [task.strip().lower() for task in tasks.split(",") if task.strip()]
+
+
+def execution_required_tasks(tasks: str) -> List[str]:
+    execution_prefixes = (
+        "humaneval",
+        "mbpp",
+        "apps",
+        "ds1000",
+        "multiple",
+        "mercury",
+        "studenteval",
+    )
+    return [
+        task
+        for task in task_names(tasks)
+        if any(task == prefix or task.startswith(prefix + "-") for prefix in execution_prefixes)
+    ]
+
+
+def validate_eval_mode(args: argparse.Namespace) -> None:
+    requires_execution = execution_required_tasks(args.tasks)
+    if args.generation_only:
+        print("mode: generation-only (generations are saved; benchmark metrics are not computed)")
+        return
+    if args.no_allow_code_execution and requires_execution:
+        task_list = ", ".join(requires_execution)
+        raise SystemExit(
+            f"error: task(s) require code execution for benchmark metrics: {task_list}. "
+            "Remove --no-allow-code-execution, or add --generation-only if you only want saved generations."
+        )
+
+
 def resolve_path(value: str, base: Path) -> Path:
     path = Path(value)
     if path.is_absolute():
@@ -320,11 +354,12 @@ def main() -> int:
     output_dir = resolve_path(config["paths"]["output_dir"], REPO_ROOT)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    eval_model = resolve_eval_model(args, config)
-
     eval_cfg = config.get("evaluation", {}).get("bigcode_harness", {})
     configured_command = list(eval_cfg.get("command", []))
     args.tasks = args.tasks or get_command_arg(configured_command, "--tasks", "humaneval,mbpp")
+    validate_eval_mode(args)
+
+    eval_model = resolve_eval_model(args, config)
     task_name = safe_name(args.tasks)
     metric_output_path = (
         resolve_path(args.metric_output_path, Path.cwd())
