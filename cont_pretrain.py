@@ -1083,11 +1083,21 @@ def tokenize_with_fim(
     if rng.random() >= fim_probability(tokens_seen, config):
         return tokens, "standard"
 
-    a, b = sorted(rng.sample(range(1, len(tokens)), 2))
-    prefix, middle, suffix = tokens[:a], tokens[a:b], tokens[b:]
     fim_prefix_id = tokenizer.convert_tokens_to_ids(config["special_tokens"]["fim_prefix"])
     fim_middle_id = tokenizer.convert_tokens_to_ids(config["special_tokens"]["fim_middle"])
     fim_suffix_id = tokenizer.convert_tokens_to_ids(config["special_tokens"]["fim_suffix"])
+
+    # End-of-file completion: empty suffix, PSM order. Matches the prompt
+    # shape used at inference when the cursor is at end-of-buffer.
+    end_frac = float(config["fim"].get("end_completion_fraction", 0.0))
+    if end_frac > 0.0 and rng.random() < end_frac:
+        min_chunk = max(1, int(config["fim"].get("min_tokens", 8)) // 2)
+        a = rng.randint(min_chunk, len(tokens) - min_chunk)
+        prefix, middle = tokens[:a], tokens[a:]
+        return [fim_prefix_id] + prefix + [fim_suffix_id] + [fim_middle_id] + middle, "fim_psm"
+
+    a, b = sorted(rng.sample(range(1, len(tokens)), 2))
+    prefix, middle, suffix = tokens[:a], tokens[a:b], tokens[b:]
 
     if rng.random() < float(config["fim"].get("psm_fraction", 0.5)):
         return [fim_prefix_id] + prefix + [fim_suffix_id] + suffix + [fim_middle_id] + middle, "fim_psm"
