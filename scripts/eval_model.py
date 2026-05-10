@@ -204,6 +204,7 @@ def build_command(
     top_k = args.top_k or get_command_arg(configured_command, "--top_k", "")
     top_p = args.top_p or get_command_arg(configured_command, "--top_p", "")
     do_sample = args.do_sample or get_command_arg(configured_command, "--do_sample", "")
+    seed = args.seed or get_command_arg(configured_command, "--seed", "")
 
     command = [
         args.accelerate_bin,
@@ -237,6 +238,8 @@ def build_command(
         command.extend(["--top_p", str(top_p)])
     if do_sample != "":
         command.extend(["--do_sample", str(do_sample)])
+    if seed != "":
+        command.extend(["--seed", str(seed)])
     if args.save_generations:
         command.append("--save_generations")
         if args.save_generations_path:
@@ -290,6 +293,7 @@ def main() -> int:
     parser.add_argument("--top-k", default=None)
     parser.add_argument("--top-p", default=None)
     parser.add_argument("--do-sample", choices=("True", "False", "true", "false"), default=None)
+    parser.add_argument("--seed", default=None)
     parser.add_argument("--n-samples", default=None)
     parser.add_argument(
         "--batch-size",
