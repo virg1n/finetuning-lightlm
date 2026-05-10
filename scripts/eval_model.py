@@ -171,7 +171,7 @@ def build_command(
 
     tasks = args.tasks or get_command_arg(configured_command, "--tasks", "humaneval,mbpp")
     precision = args.precision or get_command_arg(configured_command, "--precision", "bf16")
-    max_length = args.max_length_generation or get_command_arg(configured_command, "--max_length_generation", "512")
+    max_length = args.max_length_generation or get_command_arg(configured_command, "--max_length_generation", "1024")
     temperature = args.temperature or get_command_arg(configured_command, "--temperature", "0.2")
     n_samples = args.n_samples or get_command_arg(configured_command, "--n_samples", "1")
     batch_size = args.batch_size or get_command_arg(configured_command, "--batch_size", "1")
@@ -202,6 +202,18 @@ def build_command(
         "--metric_output_path",
         str(metric_output_path),
     ]
+    if args.save_generations:
+        command.append("--save_generations")
+        if args.save_generations_path:
+            command.extend(["--save_generations_path", str(resolve_path(args.save_generations_path, Path.cwd()))])
+    if args.generation_only:
+        command.append("--generation_only")
+    if args.load_generations_path:
+        command.extend(["--load_generations_path", str(resolve_path(args.load_generations_path, Path.cwd()))])
+    if args.check_references:
+        command.append("--check_references")
+    if args.limit:
+        command.extend(["--limit", str(args.limit)])
     if not args.no_allow_code_execution:
         command.append("--allow_code_execution")
 
@@ -229,7 +241,11 @@ def main() -> int:
     parser.add_argument("--harness-dir", default=None)
     parser.add_argument("--tasks", default=None)
     parser.add_argument("--precision", default=None)
-    parser.add_argument("--max-length-generation", default=None)
+    parser.add_argument(
+        "--max-length-generation",
+        default="1024",
+        help="Total prompt+completion length for the harness. 1024 avoids zero-room MBPP prompts.",
+    )
     parser.add_argument("--temperature", default=None)
     parser.add_argument("--n-samples", default=None)
     parser.add_argument(
@@ -242,6 +258,12 @@ def main() -> int:
     parser.add_argument("--accelerate-bin", default="accelerate")
     parser.add_argument("--metric-output-path", default=None)
     parser.add_argument("--stdout-log-file", default=None)
+    parser.add_argument("--save-generations", action="store_true")
+    parser.add_argument("--save-generations-path", default=None)
+    parser.add_argument("--generation-only", action="store_true")
+    parser.add_argument("--load-generations-path", default=None)
+    parser.add_argument("--check-references", action="store_true")
+    parser.add_argument("--limit", default=None, help="Optional harness limit for quick smoke tests.")
     parser.add_argument("--no-allow-code-execution", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
