@@ -69,7 +69,7 @@
   "fim": {
     "enabled": true,
     "max_probability": 0.6,
-    "start_probability": 0.1,
+    "start_probability": 0.2,
     "ramp_tokens": 13000000000,
     "psm_fraction": 0.5,
     "end_completion_fraction": 0.25,
