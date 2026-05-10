@@ -79,9 +79,14 @@ def generate(
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Generate text from the configured base LightLM model.")
+    parser = argparse.ArgumentParser(description="Generate text from a configured LightLM checkpoint.")
     parser.add_argument("prompt", nargs="?", default=None, help="Prompt text. If omitted, stdin is used.")
     parser.add_argument("--config", default="config.json")
+    parser.add_argument(
+        "--checkpoint",
+        default="base",
+        help="'base', 'latest', or a local cpt_step_*.pt path.",
+    )
     parser.add_argument("--max-new-tokens", type=int, default=128)
     parser.add_argument("--temperature", type=float, default=0.2)
     parser.add_argument("--top-k", type=int, default=50)
@@ -101,7 +106,7 @@ def main() -> int:
         torch.cuda.manual_seed_all(args.seed)
 
     config = copy.deepcopy(read_json((Path.cwd() / args.config).resolve()))
-    config["model"]["resume_checkpoint"] = ""
+    config["model"]["resume_checkpoint"] = "" if args.checkpoint == "base" else args.checkpoint
     config["model"]["use_cache"] = True
 
     device = torch.device(args.device)
