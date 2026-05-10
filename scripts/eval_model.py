@@ -82,6 +82,12 @@ def print_results(path: Path) -> None:
             print(f"    keys: {', '.join(sorted(task_result.keys()))}")
 
 
+def expected_generation_paths(save_generations_path: str, tasks: str) -> List[Path]:
+    base = resolve_path(save_generations_path, Path.cwd())
+    stem = base.with_suffix("")
+    return [stem.with_name(f"{stem.name}_{task}.json") for task in tasks.split(",") if task]
+
+
 def get_command_arg(command: List[str], name: str, default: str) -> str:
     try:
         idx = command.index(name)
@@ -309,6 +315,9 @@ def main() -> int:
     if args.dry_run:
         return 0
 
+    if metric_output_path.exists() and not args.generation_only:
+        metric_output_path.unlink()
+
     with stdout_log_file.open("wb") as f:
         result = subprocess.run(
             command,
@@ -320,7 +329,13 @@ def main() -> int:
         )
 
     print(f"returncode: {result.returncode}")
-    print_results(metric_output_path)
+    if args.generation_only:
+        save_path = args.save_generations_path or "generations.json"
+        print("generation_only: metric results are not written by the harness")
+        for path in expected_generation_paths(save_path, args.tasks):
+            print(f"generation_file: {path}")
+    else:
+        print_results(metric_output_path)
     if result.returncode != 0:
         print(f"eval failed; inspect log: {stdout_log_file}")
     return int(result.returncode)
