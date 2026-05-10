@@ -37,6 +37,14 @@ def clean_distributed_env() -> Dict[str, str]:
         "TORCHELASTIC_USE_AGENT_STORE",
     ):
         env.pop(key, None)
+    env.setdefault("TRANSFORMERS_NO_TF", "1")
+    env.setdefault("TRANSFORMERS_NO_FLAX", "1")
+    env.setdefault("USE_TF", "0")
+    env.setdefault("USE_FLAX", "0")
+    if os.name == "nt":
+        stub_dir = str((REPO_ROOT / "scripts" / "harness_stubs").resolve())
+        old_pythonpath = env.get("PYTHONPATH")
+        env["PYTHONPATH"] = stub_dir if not old_pythonpath else os.pathsep.join([stub_dir, old_pythonpath])
     return env
 
 
