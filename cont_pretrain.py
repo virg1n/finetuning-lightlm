@@ -2012,23 +2012,28 @@ def train_shard(
                 f"lr={lr:.2e} tok/s={toks_per_sec:.0f}"
             )
 
-        if rank0() and (global_step % checkpoint_interval == 0):
-            last_checkpoint = save_checkpoint(
-                config, model, optimizer, global_step, tokens_trained, int(shard["id"]), microbatch
-            )
-            manifest = load_manifest(Path(config["paths"]["manifest_path"]))
-            manifest["global_step"] = global_step
-            manifest["tokens_trained"] = tokens_trained
-            run_bigcode_eval(config, tokenizer, model, global_step, tokens_trained, last_checkpoint, manifest)
-            with locked_manifest(config) as current_manifest:
-                current_manifest["global_step"] = global_step
-                current_manifest["tokens_trained"] = tokens_trained
-                current_manifest["next_eval_tokens"] = manifest.get(
-                    "next_eval_tokens",
-                    current_manifest.get("next_eval_tokens", 0),
+        if global_step % checkpoint_interval == 0:
+            def checkpoint_eval_stage() -> None:
+                nonlocal last_checkpoint
+                last_checkpoint = save_checkpoint(
+                    config, model, optimizer, global_step, tokens_trained, int(shard["id"]), microbatch
                 )
+                manifest = load_manifest(Path(config["paths"]["manifest_path"]))
+                manifest["global_step"] = global_step
+                manifest["tokens_trained"] = tokens_trained
+                run_bigcode_eval(config, tokenizer, model, global_step, tokens_trained, last_checkpoint, manifest)
+                with locked_manifest(config) as current_manifest:
+                    current_manifest["global_step"] = global_step
+                    current_manifest["tokens_trained"] = tokens_trained
+                    current_manifest["next_eval_tokens"] = manifest.get(
+                        "next_eval_tokens",
+                        current_manifest.get("next_eval_tokens", 0),
+                    )
 
-    if rank0():
+            run_rank0_stage(config, f"checkpoint_eval_step_{global_step}", checkpoint_eval_stage)
+
+    def final_checkpoint_eval_stage() -> None:
+        nonlocal last_checkpoint
         last_checkpoint = save_checkpoint(
             config, model, optimizer, global_step, tokens_trained, int(shard["id"]), microbatch
         )
@@ -2054,6 +2059,8 @@ def train_shard(
                 "elapsed_seconds": time.perf_counter() - start_time,
             },
         )
+
+    run_rank0_stage(config, f"final_checkpoint_eval_shard_{shard['id']}", final_checkpoint_eval_stage)
     return global_step, tokens_trained
 
 
