@@ -167,6 +167,8 @@ class GroupedQueryAttention(nn.Module):
 
 
     def apply_rotary_pos(self, q, k, cos, sin):
+        cos = cos.to(device=q.device, dtype=q.dtype)
+        sin = sin.to(device=q.device, dtype=q.dtype)
         q_rot = q * cos + self.rotate_half(q) * sin
         k_rot = k * cos + self.rotate_half(k) * sin
         return q_rot, k_rot
