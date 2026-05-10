@@ -193,6 +193,9 @@ def build_command(
     temperature = args.temperature or get_command_arg(configured_command, "--temperature", "0.2")
     n_samples = args.n_samples or get_command_arg(configured_command, "--n_samples", "1")
     batch_size = args.batch_size or get_command_arg(configured_command, "--batch_size", "1")
+    top_k = args.top_k or get_command_arg(configured_command, "--top_k", "")
+    top_p = args.top_p or get_command_arg(configured_command, "--top_p", "")
+    do_sample = args.do_sample or get_command_arg(configured_command, "--do_sample", "")
 
     command = [
         args.accelerate_bin,
@@ -220,6 +223,12 @@ def build_command(
         "--metric_output_path",
         str(metric_output_path),
     ]
+    if top_k != "":
+        command.extend(["--top_k", str(top_k)])
+    if top_p != "":
+        command.extend(["--top_p", str(top_p)])
+    if do_sample != "":
+        command.extend(["--do_sample", str(do_sample)])
     if args.save_generations:
         command.append("--save_generations")
         if args.save_generations_path:
@@ -270,6 +279,9 @@ def main() -> int:
         help="Total prompt+completion length for the harness. 1024 avoids zero-room MBPP prompts.",
     )
     parser.add_argument("--temperature", default=None)
+    parser.add_argument("--top-k", default=None)
+    parser.add_argument("--top-p", default=None)
+    parser.add_argument("--do-sample", choices=("True", "False", "true", "false"), default=None)
     parser.add_argument("--n-samples", default=None)
     parser.add_argument(
         "--batch-size",

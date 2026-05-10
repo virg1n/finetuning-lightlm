@@ -88,6 +88,7 @@ def main() -> int:
     parser.add_argument("--top-p", type=float, default=0.95)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--dtype", choices=("fp32", "bf16", "fp16"), default=None)
+    parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--no-cache", action="store_true")
     parser.add_argument("--full-text", action="store_true", help="Print prompt plus completion.")
     args = parser.parse_args()
@@ -95,6 +96,9 @@ def main() -> int:
     prompt = args.prompt if args.prompt is not None else sys.stdin.read()
     if not prompt:
         raise SystemExit("Prompt is empty.")
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
 
     config = copy.deepcopy(read_json((Path.cwd() / args.config).resolve()))
     config["model"]["resume_checkpoint"] = ""
