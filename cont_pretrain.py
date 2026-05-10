@@ -47,6 +47,13 @@ except ImportError:
 
 MODES = {"standard": 0, "fim_psm": 1, "fim_spm": 2}
 MODE_NAMES = {v: k for k, v in MODES.items()}
+
+_DOCSTRING_AFTER_DEF = re.compile(
+    r'^(?P<indent>[ \t]*)(?:async[ \t]+)?def[ \t]+\w+[ \t]*\([\s\S]*?\)[ \t]*'
+    r'(?:->[\s\S]*?)?:[ \t]*\n'
+    r'(?P=indent)[ \t]+(?P<q>"""|\'\'\')[\s\S]*?(?P=q)',
+    re.MULTILINE,
+)
 CODE_CATEGORIES = {"python_code", "other_code"}
 
 STOPWORDS = {
@@ -1086,6 +1093,33 @@ def tokenize_with_fim(
     fim_prefix_id = tokenizer.convert_tokens_to_ids(config["special_tokens"]["fim_prefix"])
     fim_middle_id = tokenizer.convert_tokens_to_ids(config["special_tokens"]["fim_middle"])
     fim_suffix_id = tokenizer.convert_tokens_to_ids(config["special_tokens"]["fim_suffix"])
+
+    # HumanEval-style completion: place the cut right after a `def ...: """docstring"""`.
+    # Trains the model to fill the function body given signature + docstring.
+    he_frac = float(config["fim"].get("humaneval_completion_fraction", 0.0))
+    if he_frac > 0.0 and category == "python_code" and rng.random() < he_frac:
+        text = doc["text"]
+        matches = list(_DOCSTRING_AFTER_DEF.finditer(text))
+        if matches:
+            m = rng.choice(matches)
+            cut = m.end()
+            prefix_text, middle_text = text[:cut], text[cut:]
+            if middle_text.strip():
+                head: List[int] = []
+                path = doc.get("path")
+                if path and rng.random() < float(config["fim"].get("prepend_filename_probability", 0.0)):
+                    filename_id = tokenizer.convert_tokens_to_ids(config["special_tokens"]["filename"])
+                    head.append(filename_id)
+                    head.extend(tokenizer.encode(str(path) + "\n", add_special_tokens=False))
+                prefix_tokens = head + tokenizer.encode(prefix_text, add_special_tokens=False)
+                middle_tokens = tokenizer.encode(middle_text, add_special_tokens=False)
+                if len(prefix_tokens) >= 4 and len(middle_tokens) >= 4:
+                    return (
+                        [fim_prefix_id] + prefix_tokens + [fim_suffix_id]
+                        + [fim_middle_id] + middle_tokens,
+                        "fim_psm",
+                    )
+        # fall through if no docstring found or chunks too short
 
     # End-of-file completion: empty suffix, PSM order. Matches the prompt
     # shape used at inference when the cursor is at end-of-buffer.

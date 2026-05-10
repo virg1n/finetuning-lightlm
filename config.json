@@ -73,6 +73,7 @@
     "ramp_tokens": 13000000000,
     "psm_fraction": 0.5,
     "end_completion_fraction": 0.25,
+    "humaneval_completion_fraction": 0.15,
     "min_chars": 32,
     "min_tokens": 8,
     "apply_to_categories": ["python_code", "other_code"],
