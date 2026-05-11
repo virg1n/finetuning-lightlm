@@ -7,13 +7,14 @@ import os
 import random
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import threading
 import time
 import warnings
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait as futures_wait
 from contextlib import contextmanager, nullcontext
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
@@ -1210,11 +1211,13 @@ def _consume_source(
     writer_lock: threading.Lock,
     token_counter: List[int],
     counter_lock: threading.Lock,
+    progress_times: Dict[str, float],
 ) -> Dict[str, Any]:
     # Per-source streamer used by the threaded shard builder. Writer access
     # and the shared FIM-position counter are the only cross-thread state;
     # both are guarded by locks. Each source seeds its own RNG so tokenize
-    # decisions are independent of thread scheduling.
+    # decisions are independent of thread scheduling. progress_times[source_id]
+    # is updated on each successful row read so a watchdog can spot stalls.
     source_id = source["id"]
     rng = random.Random(
         int(config["seed"]) + int(shard_id) * 1_000_003 + (hash(source_id) & 0xFFFFFFFF)
@@ -1245,6 +1248,9 @@ def _consume_source(
     )
     progress_interval = int(config["tokens"].get("progress_log_tokens", 1_000_000))
 
+    def mark_alive() -> None:
+        progress_times[source_id] = time.time()
+
     def handle_stream_error(exc: Exception, stream_skip: int) -> None:
         nonlocal consecutive_stream_errors, stream_retries
         consecutive_stream_errors += 1
@@ -1265,8 +1271,10 @@ def _consume_source(
             f"in {sleep_seconds:.1f}s (retry {consecutive_stream_errors}/{max_stream_retries})."
         )
         time.sleep(sleep_seconds)
+        mark_alive()
 
     log_rank0(f"Source {source_id} target={target:,} tokens")
+    mark_alive()
 
     while source_tokens < target and not source_exhausted:
         stream_skip = base_skip + source_examples
@@ -1276,6 +1284,7 @@ def _consume_source(
             handle_stream_error(exc, stream_skip)
             continue
         stream_iter = iter(stream)
+        mark_alive()
         while source_tokens < target:
             try:
                 row = next(stream_iter)
@@ -1287,6 +1296,7 @@ def _consume_source(
                 break
             consecutive_stream_errors = 0
             source_examples += 1
+            mark_alive()
             if source_docs == 0 and source_examples >= max_empty_examples:
                 keys = ", ".join(sorted(str(key) for key in row.keys()))
                 raise RuntimeError(
@@ -1385,41 +1395,102 @@ def build_shard(
             source_offsets[source_id] = 0
 
     active_sources = [s for s in enabled_sources(config) if int(targets.get(s["id"], 0)) > 0]
-    configured_workers = int(config["training"].get("max_parallel_sources", 8))
+    configured_workers = int(config["training"].get("max_parallel_sources", 4))
     max_workers = max(1, min(configured_workers, len(active_sources))) if active_sources else 1
+
+    stream_timeout = float(config["training"].get("stream_read_timeout_seconds", 120))
+    shard_build_timeout = float(config["training"].get("shard_build_timeout_seconds", 3600))
+    stall_warn_seconds = float(config["training"].get("source_stall_warn_seconds", 300))
+
     log_rank0(
         f"Building shard {shard_id} at {shard_dir} "
         f"target={shard_target:,} tokens start={shard_start_tokens:,} "
-        f"sources={len(active_sources)} parallel={max_workers}"
+        f"sources={len(active_sources)} parallel={max_workers} "
+        f"stream_timeout={stream_timeout}s build_timeout={shard_build_timeout}s"
     )
 
     writer_lock = threading.Lock()
     counter_lock = threading.Lock()
     token_counter = [0]
 
-    with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="src") as pool:
-        futures = {
-            pool.submit(
-                _consume_source,
-                source,
-                int(targets.get(source["id"], 0)),
-                int(source_offsets.get(source["id"], 0)),
-                shard_id,
-                shard_start_tokens,
-                config,
-                tokenizer,
-                writer,
-                writer_lock,
-                token_counter,
-                counter_lock,
-            ): source["id"]
-            for source in active_sources
-        }
-        for future in as_completed(futures):
-            result = future.result()
-            source_offsets[result["source_id"]] = result["final_offset"]
-            source_stats[result["source_id"]] = result["stats"]
-            log_rank0(result["summary"])
+    # Apply a default socket read timeout so a hung HF stream raises instead
+    # of blocking forever; the existing per-source retry logic then reopens
+    # the stream. Save/restore around this call so we don't disturb the
+    # surrounding process when build_shard is invoked from the trainer as a
+    # fallback (the dedicated producer subprocess sets it once globally).
+    prev_socket_timeout = socket.getdefaulttimeout()
+    if stream_timeout > 0:
+        socket.setdefaulttimeout(stream_timeout)
+
+    progress_times: Dict[str, float] = {s["id"]: time.time() for s in active_sources}
+    watchdog_stop = threading.Event()
+
+    def watchdog() -> None:
+        while not watchdog_stop.wait(30):
+            now = time.time()
+            for sid, last_t in list(progress_times.items()):
+                stall = now - last_t
+                if stall > stall_warn_seconds:
+                    log_rank0(
+                        f"Watchdog: source {sid} no progress for {stall:.0f}s "
+                        f"(socket_timeout={socket.getdefaulttimeout()}s, "
+                        f"build_elapsed={now - build_started:.0f}s)."
+                    )
+
+    build_started = time.time()
+    watchdog_thread = threading.Thread(target=watchdog, daemon=True, name="src-watchdog")
+    watchdog_thread.start()
+
+    try:
+        with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="src") as pool:
+            futures = {
+                pool.submit(
+                    _consume_source,
+                    source,
+                    int(targets.get(source["id"], 0)),
+                    int(source_offsets.get(source["id"], 0)),
+                    shard_id,
+                    shard_start_tokens,
+                    config,
+                    tokenizer,
+                    writer,
+                    writer_lock,
+                    token_counter,
+                    counter_lock,
+                    progress_times,
+                ): source["id"]
+                for source in active_sources
+            }
+            deadline = build_started + shard_build_timeout
+            remaining = set(futures)
+            while remaining:
+                time_left = deadline - time.time()
+                if time_left <= 0:
+                    stuck_ids = sorted(futures[f] for f in remaining)
+                    # Raising exits the producer subprocess (or the trainer's
+                    # synchronous fallback). Stuck threads stay alive in
+                    # that doomed process until it terminates; the next
+                    # producer invocation starts clean.
+                    raise RuntimeError(
+                        f"Shard {shard_id} build timed out after "
+                        f"{shard_build_timeout:.0f}s; stuck sources: {stuck_ids}"
+                    )
+                done, _ = futures_wait(
+                    remaining,
+                    timeout=min(time_left, 30.0),
+                    return_when=FIRST_COMPLETED,
+                )
+                for future in done:
+                    remaining.discard(future)
+                    result = future.result()
+                    source_offsets[result["source_id"]] = result["final_offset"]
+                    source_stats[result["source_id"]] = result["stats"]
+                    log_rank0(result["summary"])
+    finally:
+        watchdog_stop.set()
+        watchdog_thread.join(timeout=5)
+        if stream_timeout > 0:
+            socket.setdefaulttimeout(prev_socket_timeout)
 
     tokens_written_total = token_counter[0]
     writer_stats = writer.close()
@@ -2274,7 +2345,13 @@ def shard_producer_log_path(config: Dict[str, Any]) -> Path:
 def shard_producer_loop(config: Dict[str, Any], tokenizer: Any, token_size: int) -> None:
     prefetch_shards = max(1, int(config["training"].get("prefetch_shards", 2)))
     poll_seconds = max(1.0, float(config["training"].get("shard_producer_poll_seconds", 15.0)))
-    log_rank0(f"Shard producer started with prefetch_shards={prefetch_shards}")
+    stream_timeout = float(config["training"].get("stream_read_timeout_seconds", 120))
+    if stream_timeout > 0:
+        socket.setdefaulttimeout(stream_timeout)
+    log_rank0(
+        f"Shard producer started with prefetch_shards={prefetch_shards} "
+        f"socket_default_timeout={socket.getdefaulttimeout()}s"
+    )
 
     while True:
         manifest = load_manifest(Path(config["paths"]["manifest_path"]))

@@ -102,7 +102,10 @@
     "log_interval_steps": 10,
     "parallel_shard_building": true,
     "prefetch_shards": 4,
-    "max_parallel_sources": 8,
+    "max_parallel_sources": 4,
+    "stream_read_timeout_seconds": 120,
+    "shard_build_timeout_seconds": 3600,
+    "source_stall_warn_seconds": 300,
     "shard_producer_poll_seconds": 15,
     "shard_producer_log_enabled": true,
     "delete_shard_after_train": true
