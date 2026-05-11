@@ -97,13 +97,13 @@
     "weight_decay": 0.1,
     "betas": [0.9, 0.95],
     "grad_clip": 1.0,
-    "checkpoint_interval_steps": 1000,
+    "checkpoint_interval_steps": 2000,
     "max_checkpoints_to_keep": 3,
     "log_interval_steps": 10,
     "parallel_shard_building": true,
-    "prefetch_shards": 2,
+    "prefetch_shards": 4,
     "shard_producer_poll_seconds": 15,
-    "shard_producer_log_enabled": false,
+    "shard_producer_log_enabled": true,
     "delete_shard_after_train": true
   },
   "evaluation": {
