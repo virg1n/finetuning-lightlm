@@ -9,9 +9,11 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import warnings
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager, nullcontext
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
@@ -1196,6 +1198,157 @@ class DSShardWriter:
         }
 
 
+def _consume_source(
+    source: Dict[str, Any],
+    target: int,
+    base_skip: int,
+    shard_id: int,
+    shard_start_tokens: int,
+    config: Dict[str, Any],
+    tokenizer: Any,
+    writer: DSShardWriter,
+    writer_lock: threading.Lock,
+    token_counter: List[int],
+    counter_lock: threading.Lock,
+) -> Dict[str, Any]:
+    # Per-source streamer used by the threaded shard builder. Writer access
+    # and the shared FIM-position counter are the only cross-thread state;
+    # both are guarded by locks. Each source seeds its own RNG so tokenize
+    # decisions are independent of thread scheduling.
+    source_id = source["id"]
+    rng = random.Random(
+        int(config["seed"]) + int(shard_id) * 1_000_003 + (hash(source_id) & 0xFFFFFFFF)
+    )
+
+    swh_client = None
+    if source.get("content_loader") == "stack_v2_swh":
+        swh_transport = source.get("swh_transport", "https")
+        log_rank0(
+            f"Source {source_id} uses SWH content fetches via {swh_transport}; "
+            "first rows can be slow."
+        )
+        swh_client = SWHContentClient(
+            transport=swh_transport,
+            unsigned=bool(source.get("swh_unsigned", True)),
+            timeout=int(source.get("swh_timeout_seconds", 60)),
+        )
+
+    source_tokens = 0
+    source_docs = 0
+    source_examples = 0
+    stream_retries = 0
+    consecutive_stream_errors = 0
+    max_stream_retries, retry_initial_seconds, retry_max_seconds = stream_retry_settings(config, source)
+    source_exhausted = False
+    max_empty_examples = int(
+        source.get("max_empty_examples", config["data"].get("max_empty_examples_per_source", 500_000))
+    )
+    progress_interval = int(config["tokens"].get("progress_log_tokens", 1_000_000))
+
+    def handle_stream_error(exc: Exception, stream_skip: int) -> None:
+        nonlocal consecutive_stream_errors, stream_retries
+        consecutive_stream_errors += 1
+        stream_retries += 1
+        if consecutive_stream_errors > max_stream_retries:
+            raise RuntimeError(
+                f"Source {source_id} stream failed after {max_stream_retries} retries "
+                f"at offset {stream_skip:,}."
+            ) from exc
+        sleep_seconds = retry_sleep_seconds(
+            retry_initial_seconds,
+            retry_max_seconds,
+            consecutive_stream_errors,
+        )
+        log_rank0(
+            f"Source {source_id} stream error after {source_examples:,} examples: "
+            f"{type(exc).__name__}: {exc}. Reopening at skip={stream_skip:,} "
+            f"in {sleep_seconds:.1f}s (retry {consecutive_stream_errors}/{max_stream_retries})."
+        )
+        time.sleep(sleep_seconds)
+
+    log_rank0(f"Source {source_id} target={target:,} tokens")
+
+    while source_tokens < target and not source_exhausted:
+        stream_skip = base_skip + source_examples
+        try:
+            stream = load_hf_stream(source, config, int(config["seed"]) + shard_id, stream_skip)
+        except Exception as exc:
+            handle_stream_error(exc, stream_skip)
+            continue
+        stream_iter = iter(stream)
+        while source_tokens < target:
+            try:
+                row = next(stream_iter)
+            except StopIteration:
+                source_exhausted = True
+                break
+            except Exception as exc:
+                handle_stream_error(exc, base_skip + source_examples)
+                break
+            consecutive_stream_errors = 0
+            source_examples += 1
+            if source_docs == 0 and source_examples >= max_empty_examples:
+                keys = ", ".join(sorted(str(key) for key in row.keys()))
+                raise RuntimeError(
+                    f"Source {source_id} produced zero accepted documents after "
+                    f"{source_examples:,} streamed examples. Check text_field/content_processor "
+                    f"for this dataset. Last row keys: {keys}"
+                )
+            for doc in row_to_documents(row, source, swh_client):
+                if not keep_document(doc, source, config):
+                    continue
+                with counter_lock:
+                    fim_position = shard_start_tokens + token_counter[0]
+                tokens, mode = tokenize_with_fim(
+                    doc,
+                    fim_position,
+                    rng,
+                    config,
+                    tokenizer,
+                )
+                tokens.append(tokenizer.eos_token_id)
+                token_count = len(tokens)
+                with writer_lock:
+                    writer.write(mode, tokens)
+                with counter_lock:
+                    token_counter[0] += token_count
+                    shard_total_snapshot = token_counter[0]
+                prev_tokens = source_tokens
+                source_tokens += token_count
+                source_docs += 1
+                if (
+                    source_docs == 1
+                    or source_tokens // progress_interval != prev_tokens // progress_interval
+                ):
+                    log_rank0(
+                        f"Source {source_id} progress: "
+                        f"{source_tokens:,}/{target:,} tokens, docs={source_docs:,}, "
+                        f"shard_total={shard_total_snapshot:,}"
+                    )
+                if source_tokens >= target:
+                    break
+
+    final_offset = base_skip + source_examples
+    summary = (
+        f"Finished source {source_id}: "
+        f"{source_tokens:,}/{target:,} tokens from {source_docs:,} docs "
+        f"({source_examples:,} streamed examples, retries={stream_retries})"
+    )
+    return {
+        "source_id": source_id,
+        "final_offset": final_offset,
+        "stats": {
+            "target_tokens": target,
+            "actual_tokens": source_tokens,
+            "documents": source_docs,
+            "examples_consumed": source_examples,
+            "offset": final_offset,
+            "stream_retries": stream_retries,
+        },
+        "summary": summary,
+    }
+
+
 def build_shard(
     config: Dict[str, Any],
     manifest: Dict[str, Any],
@@ -1219,10 +1372,8 @@ def build_shard(
         token_size,
         int(config["tokens"].get("max_tokens_per_ds_file", 250_000_000)),
     )
-    rng = random.Random(int(config["seed"]) + shard_id)
     source_offsets = dict(manifest.get("source_offsets", {}))
     source_stats: Dict[str, Any] = {}
-    tokens_written_total = 0
     shard_start_tokens = int(manifest.get("tokens_prepared", 0))
     for source in enabled_sources(config):
         source_id = source["id"]
@@ -1232,131 +1383,45 @@ def build_shard(
                 "but produced zero tokens."
             )
             source_offsets[source_id] = 0
+
+    active_sources = [s for s in enabled_sources(config) if int(targets.get(s["id"], 0)) > 0]
+    configured_workers = int(config["training"].get("max_parallel_sources", 8))
+    max_workers = max(1, min(configured_workers, len(active_sources))) if active_sources else 1
     log_rank0(
         f"Building shard {shard_id} at {shard_dir} "
-        f"target={shard_target:,} tokens start={shard_start_tokens:,}"
+        f"target={shard_target:,} tokens start={shard_start_tokens:,} "
+        f"sources={len(active_sources)} parallel={max_workers}"
     )
 
-    for source in enabled_sources(config):
-        target = int(targets.get(source["id"], 0))
-        if target <= 0:
-            continue
-        base_skip = int(source_offsets.get(source["id"], 0))
-        log_rank0(f"Source {source['id']} target={target:,} tokens")
-        swh_client = None
-        if source.get("content_loader") == "stack_v2_swh":
-            swh_transport = source.get("swh_transport", "https")
-            log_rank0(
-                f"Source {source['id']} uses SWH content fetches via {swh_transport}; "
-                "first rows can be slow."
-            )
-            swh_client = SWHContentClient(
-                transport=swh_transport,
-                unsigned=bool(source.get("swh_unsigned", True)),
-                timeout=int(source.get("swh_timeout_seconds", 60)),
-            )
+    writer_lock = threading.Lock()
+    counter_lock = threading.Lock()
+    token_counter = [0]
 
-        source_tokens = 0
-        source_docs = 0
-        source_examples = 0
-        stream_retries = 0
-        consecutive_stream_errors = 0
-        max_stream_retries, retry_initial_seconds, retry_max_seconds = stream_retry_settings(config, source)
-        source_exhausted = False
-        max_empty_examples = int(
-            source.get("max_empty_examples", config["data"].get("max_empty_examples_per_source", 500_000))
-        )
-
-        def retry_stream_error(exc: Exception, stream_skip: int) -> None:
-            nonlocal consecutive_stream_errors, stream_retries
-            consecutive_stream_errors += 1
-            stream_retries += 1
-            if consecutive_stream_errors > max_stream_retries:
-                raise RuntimeError(
-                    f"Source {source['id']} stream failed after {max_stream_retries} retries "
-                    f"at offset {stream_skip:,}."
-                ) from exc
-            sleep_seconds = retry_sleep_seconds(
-                retry_initial_seconds,
-                retry_max_seconds,
-                consecutive_stream_errors,
-            )
-            log_rank0(
-                f"Source {source['id']} stream error after {source_examples:,} examples: "
-                f"{type(exc).__name__}: {exc}. Reopening at skip={stream_skip:,} "
-                f"in {sleep_seconds:.1f}s (retry {consecutive_stream_errors}/{max_stream_retries})."
-            )
-            time.sleep(sleep_seconds)
-
-        while source_tokens < target and not source_exhausted:
-            stream_skip = base_skip + source_examples
-            try:
-                stream = load_hf_stream(source, config, int(config["seed"]) + shard_id, stream_skip)
-            except Exception as exc:
-                retry_stream_error(exc, stream_skip)
-                continue
-            stream_iter = iter(stream)
-            while source_tokens < target:
-                try:
-                    row = next(stream_iter)
-                except StopIteration:
-                    source_exhausted = True
-                    break
-                except Exception as exc:
-                    retry_stream_error(exc, base_skip + source_examples)
-                    break
-                consecutive_stream_errors = 0
-                source_examples += 1
-                if source_docs == 0 and source_examples >= max_empty_examples:
-                    keys = ", ".join(sorted(str(key) for key in row.keys()))
-                    raise RuntimeError(
-                        f"Source {source['id']} produced zero accepted documents after "
-                        f"{source_examples:,} streamed examples. Check text_field/content_processor "
-                        f"for this dataset. Last row keys: {keys}"
-                    )
-                for doc in row_to_documents(row, source, swh_client):
-                    if not keep_document(doc, source, config):
-                        continue
-                    tokens, mode = tokenize_with_fim(
-                        doc,
-                        shard_start_tokens + tokens_written_total,
-                        rng,
-                        config,
-                        tokenizer,
-                    )
-                    tokens.append(tokenizer.eos_token_id)
-                    writer.write(mode, tokens)
-                    source_tokens += len(tokens)
-                    source_docs += 1
-                    tokens_written_total += len(tokens)
-                    progress_interval = int(config["tokens"].get("progress_log_tokens", 1_000_000))
-                    if (
-                        source_docs == 1
-                        or source_tokens // progress_interval != (source_tokens - len(tokens)) // progress_interval
-                    ):
-                        log_rank0(
-                            f"Source {source['id']} progress: "
-                            f"{source_tokens:,}/{target:,} tokens, docs={source_docs:,}, "
-                            f"shard_total={tokens_written_total:,}"
-                        )
-                    if source_tokens >= target:
-                        break
-
-        source_offsets[source["id"]] = base_skip + source_examples
-        source_stats[source["id"]] = {
-            "target_tokens": target,
-            "actual_tokens": source_tokens,
-            "documents": source_docs,
-            "examples_consumed": source_examples,
-            "offset": source_offsets[source["id"]],
-            "stream_retries": stream_retries,
+    with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="src") as pool:
+        futures = {
+            pool.submit(
+                _consume_source,
+                source,
+                int(targets.get(source["id"], 0)),
+                int(source_offsets.get(source["id"], 0)),
+                shard_id,
+                shard_start_tokens,
+                config,
+                tokenizer,
+                writer,
+                writer_lock,
+                token_counter,
+                counter_lock,
+            ): source["id"]
+            for source in active_sources
         }
-        log_rank0(
-            f"Finished source {source['id']}: "
-            f"{source_tokens:,}/{target:,} tokens from {source_docs:,} docs "
-            f"({source_examples:,} streamed examples, retries={stream_retries})"
-        )
+        for future in as_completed(futures):
+            result = future.result()
+            source_offsets[result["source_id"]] = result["final_offset"]
+            source_stats[result["source_id"]] = result["stats"]
+            log_rank0(result["summary"])
 
+    tokens_written_total = token_counter[0]
     writer_stats = writer.close()
     log_rank0(
         f"Shard {shard_id} built: {tokens_written_total:,} tokens, "
