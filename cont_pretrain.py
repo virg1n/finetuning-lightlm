@@ -1589,6 +1589,30 @@ def reduce_mode_metrics(metrics: Dict[str, Tuple[float, int]], device: torch.dev
     return out
 
 
+def _checkpoint_payload(
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    global_step: int,
+    tokens_trained: int,
+    shard_id: int,
+    shard_microbatch: int,
+    best_loss: float,
+    loss_ema: Optional[float],
+) -> Dict[str, Any]:
+    raw_model = model.module if isinstance(model, DDP) else model
+    return {
+        "model": raw_model.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "global_step": global_step,
+        "tokens_trained": tokens_trained,
+        "shard_id": shard_id,
+        "shard_microbatch": shard_microbatch,
+        "best_loss": float(best_loss),
+        "loss_ema": (float(loss_ema) if loss_ema is not None else None),
+        "saved_at": utc_now(),
+    }
+
+
 def save_checkpoint(
     config: Dict[str, Any],
     model: torch.nn.Module,
@@ -1597,24 +1621,46 @@ def save_checkpoint(
     tokens_trained: int,
     shard_id: int,
     shard_microbatch: int,
+    best_loss: float = float("inf"),
+    loss_ema: Optional[float] = None,
 ) -> Path:
     checkpoint_dir = Path(config["paths"]["checkpoint_dir"])
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    raw_model = model.module if isinstance(model, DDP) else model
     path = checkpoint_dir / f"cpt_step_{global_step:08d}.pt"
     torch.save(
-        {
-            "model": raw_model.state_dict(),
-            "optimizer": optimizer.state_dict(),
-            "global_step": global_step,
-            "tokens_trained": tokens_trained,
-            "shard_id": shard_id,
-            "shard_microbatch": shard_microbatch,
-            "saved_at": utc_now(),
-        },
+        _checkpoint_payload(
+            model, optimizer, global_step, tokens_trained,
+            shard_id, shard_microbatch, best_loss, loss_ema,
+        ),
         path,
     )
-    prune_checkpoints(checkpoint_dir, int(config["training"].get("max_checkpoints_to_keep", 0)))
+    # Reserve one slot for the best checkpoint, so max_checkpoints_to_keep counts (recent + best).
+    max_total = int(config["training"].get("max_checkpoints_to_keep", 0))
+    prune_checkpoints(checkpoint_dir, max(max_total - 1, 1) if max_total > 0 else 0)
+    return path
+
+
+def save_best_checkpoint(
+    config: Dict[str, Any],
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    global_step: int,
+    tokens_trained: int,
+    shard_id: int,
+    shard_microbatch: int,
+    best_loss: float,
+    loss_ema: Optional[float],
+) -> Path:
+    checkpoint_dir = Path(config["paths"]["checkpoint_dir"])
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    path = checkpoint_dir / "cpt_best.pt"
+    torch.save(
+        _checkpoint_payload(
+            model, optimizer, global_step, tokens_trained,
+            shard_id, shard_microbatch, best_loss, loss_ema,
+        ),
+        path,
+    )
     return path
 
 
@@ -1945,7 +1991,7 @@ def train_shard(
     rank: int,
     world_size: int,
     resume_state: Dict[str, Any],
-) -> Tuple[int, int]:
+) -> Tuple[int, int, float, Optional[float]]:
     tcfg = config["training"]
     global_tokens_per_step = (
         int(tcfg["per_device_batch_size"])
@@ -1956,6 +2002,11 @@ def train_shard(
     total_steps = math.ceil(int(config["tokens"]["target_total_tokens"]) / global_tokens_per_step)
     global_step = int(resume_state.get("global_step", 0))
     tokens_trained = int(resume_state.get("tokens_trained", 0))
+    best_loss = float(resume_state.get("best_loss", float("inf")))
+    loss_ema: Optional[float] = resume_state.get("loss_ema")
+    if loss_ema is not None:
+        loss_ema = float(loss_ema)
+    loss_ema_alpha = float(tcfg.get("best_loss_ema_alpha", 0.1))
     start_microbatch = 0
     if int(resume_state.get("shard_id", -1)) == int(shard["id"]):
         start_microbatch = int(resume_state.get("shard_microbatch", 0))
@@ -1972,7 +2023,7 @@ def train_shard(
     if batcher.microbatches == 0:
         if rank0():
             print(f"Shard {shard['id']} has no full training batches.")
-        return global_step, tokens_trained
+        return global_step, tokens_trained, best_loss, loss_ema
 
     dtype = get_dtype(tcfg["dtype"])
     use_amp = device.type == "cuda"
@@ -1982,6 +2033,7 @@ def train_shard(
     log_interval = int(tcfg["log_interval_steps"])
     train_log = Path(config["paths"]["train_log_file"])
     last_checkpoint: Optional[Path] = None
+
     model.train()
 
     start_time = time.perf_counter()
@@ -2035,6 +2087,13 @@ def train_shard(
         elapsed = time.perf_counter() - step_start
         toks_per_sec = global_tokens_per_step / max(elapsed, 1e-6)
 
+        # Token-weighted combined loss across all modes, smoothed with an EMA for stability.
+        loss_sum_all = sum(reduced[f"loss_{m}"] * reduced[f"count_{m}"] for m in MODES)
+        count_all = sum(reduced[f"count_{m}"] for m in MODES)
+        if count_all > 0:
+            combined = loss_sum_all / count_all
+            loss_ema = combined if loss_ema is None else (1 - loss_ema_alpha) * loss_ema + loss_ema_alpha * combined
+
         if rank0() and (global_step % log_interval == 0 or global_step == 1):
             row = {
                 "event": "train_step",
@@ -2058,10 +2117,18 @@ def train_shard(
 
         if global_step % checkpoint_interval == 0:
             def checkpoint_eval_stage() -> None:
-                nonlocal last_checkpoint
+                nonlocal last_checkpoint, best_loss
                 last_checkpoint = save_checkpoint(
-                    config, model, optimizer, global_step, tokens_trained, int(shard["id"]), microbatch
+                    config, model, optimizer, global_step, tokens_trained,
+                    int(shard["id"]), microbatch, best_loss, loss_ema,
                 )
+                if loss_ema is not None and loss_ema < best_loss:
+                    best_loss = loss_ema
+                    save_best_checkpoint(
+                        config, model, optimizer, global_step, tokens_trained,
+                        int(shard["id"]), microbatch, best_loss, loss_ema,
+                    )
+                    print(f"  new best loss: {best_loss:.4f} (step {global_step}) -> cpt_best.pt")
                 manifest = load_manifest(Path(config["paths"]["manifest_path"]))
                 manifest["global_step"] = global_step
                 manifest["tokens_trained"] = tokens_trained
@@ -2077,10 +2144,18 @@ def train_shard(
             run_rank0_stage(config, f"checkpoint_eval_step_{global_step}", checkpoint_eval_stage)
 
     def final_checkpoint_eval_stage() -> None:
-        nonlocal last_checkpoint
+        nonlocal last_checkpoint, best_loss
         last_checkpoint = save_checkpoint(
-            config, model, optimizer, global_step, tokens_trained, int(shard["id"]), microbatch
+            config, model, optimizer, global_step, tokens_trained,
+            int(shard["id"]), microbatch, best_loss, loss_ema,
         )
+        if loss_ema is not None and loss_ema < best_loss:
+            best_loss = loss_ema
+            save_best_checkpoint(
+                config, model, optimizer, global_step, tokens_trained,
+                int(shard["id"]), microbatch, best_loss, loss_ema,
+            )
+            print(f"  new best loss: {best_loss:.4f} (step {global_step}) -> cpt_best.pt")
         manifest = load_manifest(Path(config["paths"]["manifest_path"]))
         manifest["global_step"] = global_step
         manifest["tokens_trained"] = tokens_trained
@@ -2105,7 +2180,7 @@ def train_shard(
         )
 
     run_rank0_stage(config, f"final_checkpoint_eval_shard_{shard['id']}", final_checkpoint_eval_stage)
-    return global_step, tokens_trained
+    return global_step, tokens_trained, best_loss, loss_ema
 
 
 def next_shard_to_train(manifest: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -2365,7 +2440,7 @@ def main() -> None:
             if args.prepare_only:
                 break
 
-            global_step, tokens_trained = train_shard(
+            global_step, tokens_trained, best_loss, loss_ema = train_shard(
                 config,
                 shard,
                 tokenizer,
@@ -2377,7 +2452,12 @@ def main() -> None:
                 world_size,
                 resume_state,
             )
-            resume_state = {"global_step": global_step, "tokens_trained": tokens_trained}
+            resume_state = {
+                "global_step": global_step,
+                "tokens_trained": tokens_trained,
+                "best_loss": best_loss,
+                "loss_ema": loss_ema,
+            }
             barrier()
 
             def finish_shard_stage() -> None:
