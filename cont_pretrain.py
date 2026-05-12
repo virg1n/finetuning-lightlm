@@ -1,9 +1,11 @@
 import argparse
 import gzip
+import hashlib
 import html
 import json
 import math
 import os
+import queue
 import random
 import re
 import shutil
@@ -14,7 +16,6 @@ import threading
 import time
 import warnings
 from collections import defaultdict
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait as futures_wait
 from contextlib import contextmanager, nullcontext
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
@@ -412,6 +413,15 @@ def infer_token_size(vocab_size: int) -> int:
     return 2 if vocab_size < 65535 else 4
 
 
+def stable_int_hash(value: str) -> int:
+    digest = hashlib.blake2s(value.encode("utf-8"), digest_size=4).digest()
+    return int.from_bytes(digest, "big")
+
+
+def source_epoch_seed(config: Dict[str, Any], source_id: str, epoch: int) -> int:
+    return (int(config["seed"]) + stable_int_hash(source_id) + int(epoch) * 1_000_003) % (2**32)
+
+
 def resolve_shard_target_tokens(config: Dict[str, Any], token_size: int) -> int:
     explicit = config["tokens"].get("shard_target_tokens")
     if explicit:
@@ -668,6 +678,7 @@ def default_manifest() -> Dict[str, Any]:
         "next_eval_tokens": 0,
         "initial_eval_done": False,
         "source_offsets": {},
+        "source_epochs": {},
         "shards": [],
     }
 
@@ -1203,6 +1214,7 @@ def _consume_source(
     source: Dict[str, Any],
     target: int,
     base_skip: int,
+    base_epoch: int,
     shard_id: int,
     shard_start_tokens: int,
     config: Dict[str, Any],
@@ -1212,6 +1224,7 @@ def _consume_source(
     token_counter: List[int],
     counter_lock: threading.Lock,
     progress_times: Dict[str, float],
+    progress_lock: threading.Lock,
 ) -> Dict[str, Any]:
     # Per-source streamer used by the threaded shard builder. Writer access
     # and the shared FIM-position counter are the only cross-thread state;
@@ -1220,7 +1233,7 @@ def _consume_source(
     # is updated on each successful row read so a watchdog can spot stalls.
     source_id = source["id"]
     rng = random.Random(
-        int(config["seed"]) + int(shard_id) * 1_000_003 + (hash(source_id) & 0xFFFFFFFF)
+        int(config["seed"]) + int(shard_id) * 1_000_003 + stable_int_hash(source_id)
     )
 
     swh_client = None
@@ -1242,23 +1255,33 @@ def _consume_source(
     stream_retries = 0
     consecutive_stream_errors = 0
     max_stream_retries, retry_initial_seconds, retry_max_seconds = stream_retry_settings(config, source)
-    source_exhausted = False
     max_empty_examples = int(
         source.get("max_empty_examples", config["data"].get("max_empty_examples_per_source", 500_000))
     )
-    progress_interval = int(config["tokens"].get("progress_log_tokens", 1_000_000))
+    progress_interval = max(1, int(config["tokens"].get("progress_log_tokens", 1_000_000)))
+    cycle_on_exhaustion = bool(source.get("cycle_on_exhaustion", config["data"].get("cycle_on_exhaustion", True)))
+    max_epochs_per_shard = max(
+        1,
+        int(source.get("max_epochs_per_shard", config["data"].get("max_source_epochs_per_shard", 16))),
+    )
+    current_epoch = int(base_epoch)
+    current_skip = max(0, int(base_skip))
+    final_epoch = current_epoch
+    final_offset = current_skip
+    epochs_completed = 0
 
     def mark_alive() -> None:
-        progress_times[source_id] = time.time()
+        with progress_lock:
+            progress_times[source_id] = time.time()
 
-    def handle_stream_error(exc: Exception, stream_skip: int) -> None:
+    def handle_stream_error(exc: Exception, stream_epoch: int, stream_skip: int) -> None:
         nonlocal consecutive_stream_errors, stream_retries
         consecutive_stream_errors += 1
         stream_retries += 1
         if consecutive_stream_errors > max_stream_retries:
             raise RuntimeError(
                 f"Source {source_id} stream failed after {max_stream_retries} retries "
-                f"at offset {stream_skip:,}."
+                f"at epoch {stream_epoch:,} offset {stream_skip:,}."
             ) from exc
         sleep_seconds = retry_sleep_seconds(
             retry_initial_seconds,
@@ -1268,7 +1291,8 @@ def _consume_source(
         log_rank0(
             f"Source {source_id} stream error after {source_examples:,} examples: "
             f"{type(exc).__name__}: {exc}. Reopening at skip={stream_skip:,} "
-            f"in {sleep_seconds:.1f}s (retry {consecutive_stream_errors}/{max_stream_retries})."
+            f"epoch={stream_epoch:,} in {sleep_seconds:.1f}s "
+            f"(retry {consecutive_stream_errors}/{max_stream_retries})."
         )
         time.sleep(sleep_seconds)
         mark_alive()
@@ -1276,12 +1300,17 @@ def _consume_source(
     log_rank0(f"Source {source_id} target={target:,} tokens")
     mark_alive()
 
-    while source_tokens < target and not source_exhausted:
-        stream_skip = base_skip + source_examples
+    while source_tokens < target:
+        stream_epoch = current_epoch
+        stream_skip = current_skip
+        stream_seed = source_epoch_seed(config, source_id, stream_epoch)
+        epoch_examples = 0
+        stream_exhausted = False
+        stream_failed = False
         try:
-            stream = load_hf_stream(source, config, int(config["seed"]) + shard_id, stream_skip)
+            stream = load_hf_stream(source, config, stream_seed, stream_skip)
         except Exception as exc:
-            handle_stream_error(exc, stream_skip)
+            handle_stream_error(exc, stream_epoch, stream_skip)
             continue
         stream_iter = iter(stream)
         mark_alive()
@@ -1289,13 +1318,20 @@ def _consume_source(
             try:
                 row = next(stream_iter)
             except StopIteration:
-                source_exhausted = True
+                stream_exhausted = True
                 break
             except Exception as exc:
-                handle_stream_error(exc, base_skip + source_examples)
+                current_skip = stream_skip + epoch_examples
+                final_epoch = stream_epoch
+                final_offset = current_skip
+                handle_stream_error(exc, stream_epoch, current_skip)
+                stream_failed = True
                 break
             consecutive_stream_errors = 0
             source_examples += 1
+            epoch_examples += 1
+            final_epoch = stream_epoch
+            final_offset = stream_skip + epoch_examples
             mark_alive()
             if source_docs == 0 and source_examples >= max_empty_examples:
                 keys = ", ".join(sorted(str(key) for key in row.keys()))
@@ -1338,21 +1374,52 @@ def _consume_source(
                 if source_tokens >= target:
                     break
 
-    final_offset = base_skip + source_examples
+        if source_tokens >= target:
+            break
+        if stream_failed:
+            continue
+        if not stream_exhausted:
+            break
+
+        epochs_completed += 1
+        next_epoch = stream_epoch + 1
+        final_epoch = next_epoch
+        final_offset = 0
+        log_rank0(
+            f"Source {source_id} exhausted epoch {stream_epoch:,} after "
+            f"{epoch_examples:,} streamed examples; "
+            f"tokens={source_tokens:,}/{target:,}."
+        )
+        if not cycle_on_exhaustion:
+            break
+        if epochs_completed >= max_epochs_per_shard:
+            log_rank0(
+                f"Source {source_id} reached max_epochs_per_shard={max_epochs_per_shard}; "
+                f"leaving source under target for this shard."
+            )
+            break
+        current_epoch = next_epoch
+        current_skip = 0
+        mark_alive()
+
     summary = (
         f"Finished source {source_id}: "
         f"{source_tokens:,}/{target:,} tokens from {source_docs:,} docs "
-        f"({source_examples:,} streamed examples, retries={stream_retries})"
+        f"({source_examples:,} streamed examples, retries={stream_retries}, "
+        f"epoch={final_epoch:,}, offset={final_offset:,})"
     )
     return {
         "source_id": source_id,
         "final_offset": final_offset,
+        "final_epoch": final_epoch,
         "stats": {
             "target_tokens": target,
             "actual_tokens": source_tokens,
             "documents": source_docs,
             "examples_consumed": source_examples,
+            "epoch": final_epoch,
             "offset": final_offset,
+            "epochs_completed": epochs_completed,
             "stream_retries": stream_retries,
         },
         "summary": summary,
@@ -1383,6 +1450,7 @@ def build_shard(
         int(config["tokens"].get("max_tokens_per_ds_file", 250_000_000)),
     )
     source_offsets = dict(manifest.get("source_offsets", {}))
+    source_epochs = dict(manifest.get("source_epochs", {}))
     source_stats: Dict[str, Any] = {}
     shard_start_tokens = int(manifest.get("tokens_prepared", 0))
     for source in enabled_sources(config):
@@ -1393,6 +1461,7 @@ def build_shard(
                 "but produced zero tokens."
             )
             source_offsets[source_id] = 0
+            source_epochs[source_id] = int(source_epochs.get(source_id, 0)) + 1
 
     active_sources = [s for s in enabled_sources(config) if int(targets.get(s["id"], 0)) > 0]
     configured_workers = int(config["training"].get("max_parallel_sources", 4))
@@ -1423,12 +1492,15 @@ def build_shard(
         socket.setdefaulttimeout(stream_timeout)
 
     progress_times: Dict[str, float] = {s["id"]: time.time() for s in active_sources}
+    progress_lock = threading.Lock()
     watchdog_stop = threading.Event()
 
     def watchdog() -> None:
         while not watchdog_stop.wait(30):
             now = time.time()
-            for sid, last_t in list(progress_times.items()):
+            with progress_lock:
+                progress_items = list(progress_times.items())
+            for sid, last_t in progress_items:
                 stall = now - last_t
                 if stall > stall_warn_seconds:
                     log_rank0(
@@ -1442,50 +1514,82 @@ def build_shard(
     watchdog_thread.start()
 
     try:
-        with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="src") as pool:
-            futures = {
-                pool.submit(
-                    _consume_source,
-                    source,
-                    int(targets.get(source["id"], 0)),
-                    int(source_offsets.get(source["id"], 0)),
-                    shard_id,
-                    shard_start_tokens,
-                    config,
-                    tokenizer,
-                    writer,
-                    writer_lock,
-                    token_counter,
-                    counter_lock,
-                    progress_times,
-                ): source["id"]
-                for source in active_sources
-            }
-            deadline = build_started + shard_build_timeout
-            remaining = set(futures)
-            while remaining:
-                time_left = deadline - time.time()
-                if time_left <= 0:
-                    stuck_ids = sorted(futures[f] for f in remaining)
-                    # Raising exits the producer subprocess (or the trainer's
-                    # synchronous fallback). Stuck threads stay alive in
-                    # that doomed process until it terminates; the next
-                    # producer invocation starts clean.
-                    raise RuntimeError(
-                        f"Shard {shard_id} build timed out after "
-                        f"{shard_build_timeout:.0f}s; stuck sources: {stuck_ids}"
-                    )
-                done, _ = futures_wait(
-                    remaining,
-                    timeout=min(time_left, 30.0),
-                    return_when=FIRST_COMPLETED,
+        result_queue: "queue.Queue[Tuple[str, bool, Any]]" = queue.Queue()
+        task_queue: "queue.Queue[Optional[Dict[str, Any]]]" = queue.Queue()
+        for source in active_sources:
+            task_queue.put(source)
+        for _ in range(max_workers):
+            task_queue.put(None)
+
+        def source_worker() -> None:
+            while True:
+                source = task_queue.get()
+                try:
+                    if source is None:
+                        return
+                    source_id = source["id"]
+                    try:
+                        result = _consume_source(
+                            source,
+                            int(targets.get(source_id, 0)),
+                            int(source_offsets.get(source_id, 0)),
+                            int(source_epochs.get(source_id, 0)),
+                            shard_id,
+                            shard_start_tokens,
+                            config,
+                            tokenizer,
+                            writer,
+                            writer_lock,
+                            token_counter,
+                            counter_lock,
+                            progress_times,
+                            progress_lock,
+                        )
+                    except BaseException as exc:
+                        result_queue.put((source_id, False, exc))
+                    else:
+                        result_queue.put((source_id, True, result))
+                finally:
+                    task_queue.task_done()
+
+        source_threads = [
+            threading.Thread(target=source_worker, daemon=True, name=f"src-{idx}")
+            for idx in range(max_workers)
+        ]
+        for thread in source_threads:
+            thread.start()
+
+        deadline = build_started + shard_build_timeout
+        remaining_sources = {source["id"] for source in active_sources}
+        while remaining_sources:
+            time_left = deadline - time.time()
+            if time_left <= 0:
+                stuck_ids = sorted(remaining_sources)
+                raise RuntimeError(
+                    f"Shard {shard_id} build timed out after "
+                    f"{shard_build_timeout:.0f}s; stuck sources: {stuck_ids}"
                 )
-                for future in done:
-                    remaining.discard(future)
-                    result = future.result()
-                    source_offsets[result["source_id"]] = result["final_offset"]
-                    source_stats[result["source_id"]] = result["stats"]
-                    log_rank0(result["summary"])
+            try:
+                source_id, ok, payload = result_queue.get(timeout=min(time_left, 30.0))
+            except queue.Empty:
+                continue
+            if source_id not in remaining_sources:
+                continue
+            remaining_sources.discard(source_id)
+            with progress_lock:
+                progress_times.pop(source_id, None)
+            if not ok:
+                raise RuntimeError(
+                    f"Source {source_id} failed while building shard {shard_id}."
+                ) from payload
+            result = payload
+            source_offsets[result["source_id"]] = result["final_offset"]
+            source_epochs[result["source_id"]] = result["final_epoch"]
+            source_stats[result["source_id"]] = result["stats"]
+            log_rank0(result["summary"])
+
+        for thread in source_threads:
+            thread.join(timeout=1)
     finally:
         watchdog_stop.set()
         watchdog_thread.join(timeout=5)
@@ -1494,6 +1598,8 @@ def build_shard(
 
     tokens_written_total = token_counter[0]
     writer_stats = writer.close()
+    if tokens_written_total <= 0:
+        raise RuntimeError(f"Shard {shard_id} produced zero tokens; refusing to add an empty shard.")
     log_rank0(
         f"Shard {shard_id} built: {tokens_written_total:,} tokens, "
         f"files={writer_stats['files']}, mode_tokens={writer_stats['mode_tokens']}"
@@ -1527,6 +1633,7 @@ def build_shard(
             )
         current_manifest["tokens_prepared"] = shard_start_tokens + tokens_written_total
         current_manifest["source_offsets"] = source_offsets
+        current_manifest["source_epochs"] = source_epochs
         current_manifest["shards"].append(shard_stats)
     return shard_stats
 
@@ -2413,6 +2520,8 @@ def wait_for_produced_shard(
             return shard
         if int(manifest.get("tokens_prepared", 0)) >= int(config["tokens"]["target_total_tokens"]):
             return None
+        if producer is None:
+            return None
         if producer is not None:
             returncode = producer.poll()
             if returncode is not None:
@@ -2558,16 +2667,15 @@ def main() -> None:
                 manifest = load_manifest(Path(config["paths"]["manifest_path"]))
                 shard = next_shard_to_train(manifest)
                 if shard is None and int(manifest["tokens_prepared"]) < int(config["tokens"]["target_total_tokens"]):
-                    if config["training"].get("parallel_shard_building", True) and not args.prepare_only:
+                    if parallel_shard_building:
                         shard = wait_for_produced_shard(config, shard_producer)
-                        if (
-                            shard is None
-                            and shard_producer is not None
-                            and shard_producer.poll() is not None
-                        ):
+                        if shard is None:
                             stop_shard_producer(shard_producer)
                             shard_producer = None
                             shard = build_next_shard(config, tokenizer, token_size)
+                            refreshed = load_manifest(Path(config["paths"]["manifest_path"]))
+                            if int(refreshed.get("tokens_prepared", 0)) < int(config["tokens"]["target_total_tokens"]):
+                                shard_producer = start_shard_producer(config, args.config)
                     else:
                         shard = build_next_shard(config, tokenizer, token_size)
                 if shard is not None and not args.prepare_only:
