@@ -551,15 +551,16 @@ class Transformer(nn.Module, PyTorchModelHubMixin): # extending PyTorchModelHubM
                 total_aux_loss += aux_loss
         
         x = self.norm(x)
+        aux_output = total_aux_loss if self.use_moe and not self.use_lossfreebalance else None
         if return_hidden:
-            return x, None, None
+            return x, None, aux_output
 
         logits = self.ll_head(x)
         
         
         if targets is None:
             loss = None
-            ce_loss = None
+            ce_loss = aux_output
         else:
             c_batch_size, c_context_len, c_dim = logits.shape
             logits = logits.view(c_batch_size*c_context_len, c_dim)

@@ -1468,14 +1468,17 @@ def build_shard(
     max_workers = max(1, min(configured_workers, len(active_sources))) if active_sources else 1
 
     stream_timeout = float(config["training"].get("stream_read_timeout_seconds", 120))
-    shard_build_timeout = float(config["training"].get("shard_build_timeout_seconds", 3600))
+    shard_build_timeout = float(config["training"].get("shard_build_timeout_seconds", 0))
+    shard_build_timeout_text = (
+        f"{shard_build_timeout}s" if shard_build_timeout > 0 else "disabled"
+    )
     stall_warn_seconds = float(config["training"].get("source_stall_warn_seconds", 300))
 
     log_rank0(
         f"Building shard {shard_id} at {shard_dir} "
         f"target={shard_target:,} tokens start={shard_start_tokens:,} "
         f"sources={len(active_sources)} parallel={max_workers} "
-        f"stream_timeout={stream_timeout}s build_timeout={shard_build_timeout}s"
+        f"stream_timeout={stream_timeout}s build_timeout={shard_build_timeout_text}"
     )
 
     writer_lock = threading.Lock()
@@ -1559,18 +1562,22 @@ def build_shard(
         for thread in source_threads:
             thread.start()
 
-        deadline = build_started + shard_build_timeout
+        deadline = build_started + shard_build_timeout if shard_build_timeout > 0 else None
         remaining_sources = {source["id"] for source in active_sources}
         while remaining_sources:
-            time_left = deadline - time.time()
-            if time_left <= 0:
-                stuck_ids = sorted(remaining_sources)
-                raise RuntimeError(
-                    f"Shard {shard_id} build timed out after "
-                    f"{shard_build_timeout:.0f}s; stuck sources: {stuck_ids}"
-                )
+            if deadline is None:
+                result_timeout = 30.0
+            else:
+                time_left = deadline - time.time()
+                if time_left <= 0:
+                    stuck_ids = sorted(remaining_sources)
+                    raise RuntimeError(
+                        f"Shard {shard_id} build timed out after "
+                        f"{shard_build_timeout:.0f}s; stuck sources: {stuck_ids}"
+                    )
+                result_timeout = min(time_left, 30.0)
             try:
-                source_id, ok, payload = result_queue.get(timeout=min(time_left, 30.0))
+                source_id, ok, payload = result_queue.get(timeout=result_timeout)
             except queue.Empty:
                 continue
             if source_id not in remaining_sources:
@@ -1738,7 +1745,7 @@ def compute_loss_by_mode(
     loss_chunk_tokens: int = 0,
 ) -> Tuple[torch.Tensor, Dict[str, Tuple[float, int]]]:
     if loss_chunk_tokens > 0 and loss_chunk_tokens < y.shape[1]:
-        hidden, _, _ = model(x, targets=None, positions=positions, return_hidden=True)
+        hidden, _, aux_loss = model(x, targets=None, positions=positions, return_hidden=True)
         head = getattr(model, "module", model).ll_head
         batch_size, seq_len = y.shape
         sample_loss_sums = torch.zeros(batch_size, device=y.device, dtype=torch.float32)
@@ -1784,6 +1791,8 @@ def compute_loss_by_mode(
             )
         sample_loss = sample_loss_sums / valid_tokens
         loss = sample_loss.mean()
+        if torch.is_tensor(aux_loss):
+            loss = loss + aux_loss
         metrics: Dict[str, Tuple[float, int]] = {}
         for mode_id, mode_name in MODE_NAMES.items():
             mask = modes == mode_id
@@ -1794,7 +1803,7 @@ def compute_loss_by_mode(
                 metrics[mode_name] = (0.0, 0)
         return loss, metrics
 
-    logits, _, _ = model(x, targets=None, positions=positions)
+    logits, _, aux_loss = model(x, targets=None, positions=positions)
     vocab = logits.shape[-1]
     token_loss = F.cross_entropy(logits.reshape(-1, vocab), y.reshape(-1), reduction="none").view(y.shape)
     if loss_mask is not None:
@@ -1804,6 +1813,8 @@ def compute_loss_by_mode(
     else:
         sample_loss = token_loss.mean(dim=1)
     loss = sample_loss.mean()
+    if torch.is_tensor(aux_loss):
+        loss = loss + aux_loss
     metrics: Dict[str, Tuple[float, int]] = {}
     for mode_id, mode_name in MODE_NAMES.items():
         mask = modes == mode_id
