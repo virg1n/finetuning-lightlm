@@ -163,7 +163,7 @@
     "max_source_epochs_per_shard": 16,
     "python_chunking": {
       "enabled": true,
-      "split_probability": 0.25,
+      "split_probability": 0.1,
       "emit_top_level_functions": true,
       "emit_methods": true,
       "emit_classes": false,
