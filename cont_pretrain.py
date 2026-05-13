@@ -757,10 +757,15 @@ def load_hf_stream(source: Dict[str, Any], config: Dict[str, Any], seed: int, sk
             "or disable this source."
         ) from exc
     shuffle_buffer = int(source.get("shuffle_buffer", config["data"].get("stream_shuffle_buffer", 0)))
+    skip_before_shuffle = bool(source.get("skip_before_shuffle", config["data"].get("skip_before_shuffle", True)))
+    if skip > 0 and skip_before_shuffle:
+        log_rank0(f"Skipping source {source['id']} before shuffle: {skip:,} examples")
+        dataset = dataset.skip(skip)
     if shuffle_buffer > 0:
         log_rank0(f"Shuffling source {source['id']} with buffer_size={shuffle_buffer:,}")
         dataset = dataset.shuffle(buffer_size=shuffle_buffer, seed=seed)
-    if skip > 0:
+    if skip > 0 and not skip_before_shuffle:
+        log_rank0(f"Skipping source {source['id']} after shuffle: {skip:,} examples")
         dataset = dataset.skip(skip)
     return dataset
 
@@ -1225,6 +1230,7 @@ def _consume_source(
     counter_lock: threading.Lock,
     progress_times: Dict[str, float],
     progress_lock: threading.Lock,
+    stream_state: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     # Per-source streamer used by the threaded shard builder. Writer access
     # and the shared FIM-position counter are the only cross-thread state;
@@ -1269,6 +1275,7 @@ def _consume_source(
     final_epoch = current_epoch
     final_offset = current_skip
     epochs_completed = 0
+    active_stream_iter = None
 
     def mark_alive() -> None:
         with progress_lock:
@@ -1303,17 +1310,32 @@ def _consume_source(
     while source_tokens < target:
         stream_epoch = current_epoch
         stream_skip = current_skip
-        stream_seed = source_epoch_seed(config, source_id, stream_epoch)
         epoch_examples = 0
         stream_exhausted = False
         stream_failed = False
-        try:
-            stream = load_hf_stream(source, config, stream_seed, stream_skip)
-        except Exception as exc:
-            handle_stream_error(exc, stream_epoch, stream_skip)
-            continue
-        stream_iter = iter(stream)
-        mark_alive()
+        if (
+            stream_state is not None
+            and stream_state.get("iterator") is not None
+            and int(stream_state.get("epoch", -1)) == stream_epoch
+            and int(stream_state.get("offset", -1)) == stream_skip
+        ):
+            stream_iter = stream_state["iterator"]
+            active_stream_iter = stream_iter
+            log_rank0(
+                f"Continuing source {source_id} from live stream "
+                f"epoch={stream_epoch:,} offset={stream_skip:,}"
+            )
+            mark_alive()
+        else:
+            stream_seed = source_epoch_seed(config, source_id, stream_epoch)
+            try:
+                stream = load_hf_stream(source, config, stream_seed, stream_skip)
+            except Exception as exc:
+                handle_stream_error(exc, stream_epoch, stream_skip)
+                continue
+            stream_iter = iter(stream)
+            active_stream_iter = stream_iter
+            mark_alive()
         while source_tokens < target:
             try:
                 row = next(stream_iter)
@@ -1321,6 +1343,9 @@ def _consume_source(
                 stream_exhausted = True
                 break
             except Exception as exc:
+                active_stream_iter = None
+                if stream_state is not None:
+                    stream_state.clear()
                 current_skip = stream_skip + epoch_examples
                 final_epoch = stream_epoch
                 final_offset = current_skip
@@ -1400,7 +1425,21 @@ def _consume_source(
             break
         current_epoch = next_epoch
         current_skip = 0
+        active_stream_iter = None
+        if stream_state is not None:
+            stream_state.clear()
         mark_alive()
+
+    if stream_state is not None:
+        stream_state.clear()
+        if active_stream_iter is not None and source_tokens >= target:
+            stream_state.update(
+                {
+                    "iterator": active_stream_iter,
+                    "epoch": final_epoch,
+                    "offset": final_offset,
+                }
+            )
 
     summary = (
         f"Finished source {source_id}: "
@@ -1432,6 +1471,7 @@ def build_shard(
     shard_id: int,
     tokenizer: Any,
     token_size: int,
+    source_stream_states: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     shard_root = Path(config["paths"]["shard_root"])
     shard_dir = shard_root / f"shard_{shard_id:05d}"
@@ -1547,6 +1587,11 @@ def build_shard(
                             counter_lock,
                             progress_times,
                             progress_lock,
+                            (
+                                source_stream_states.setdefault(source_id, {})
+                                if source_stream_states is not None
+                                else None
+                            ),
                         )
                     except BaseException as exc:
                         result_queue.put((source_id, False, exc))
@@ -2448,12 +2493,24 @@ def count_prefetch_shards(manifest: Dict[str, Any]) -> int:
     return sum(1 for shard in manifest.get("shards", []) if shard.get("status") in {"built", "training"})
 
 
-def build_next_shard(config: Dict[str, Any], tokenizer: Any, token_size: int) -> Optional[Dict[str, Any]]:
+def build_next_shard(
+    config: Dict[str, Any],
+    tokenizer: Any,
+    token_size: int,
+    source_stream_states: Optional[Dict[str, Dict[str, Any]]] = None,
+) -> Optional[Dict[str, Any]]:
     with file_lock(shard_build_lock_path(config)):
         manifest = load_manifest(Path(config["paths"]["manifest_path"]))
         if int(manifest.get("tokens_prepared", 0)) >= int(config["tokens"]["target_total_tokens"]):
             return None
-        return build_shard(config, manifest, len(manifest.get("shards", [])), tokenizer, token_size)
+        return build_shard(
+            config,
+            manifest,
+            len(manifest.get("shards", [])),
+            tokenizer,
+            token_size,
+            source_stream_states,
+        )
 
 
 def shard_producer_log_path(config: Dict[str, Any]) -> Path:
@@ -2464,6 +2521,7 @@ def shard_producer_loop(config: Dict[str, Any], tokenizer: Any, token_size: int)
     prefetch_shards = max(1, int(config["training"].get("prefetch_shards", 2)))
     poll_seconds = max(1.0, float(config["training"].get("shard_producer_poll_seconds", 15.0)))
     stream_timeout = float(config["training"].get("stream_read_timeout_seconds", 120))
+    source_stream_states: Dict[str, Dict[str, Any]] = {}
     if stream_timeout > 0:
         socket.setdefaulttimeout(stream_timeout)
     log_rank0(
@@ -2479,7 +2537,7 @@ def shard_producer_loop(config: Dict[str, Any], tokenizer: Any, token_size: int)
         if count_prefetch_shards(manifest) >= prefetch_shards:
             time.sleep(poll_seconds)
             continue
-        build_next_shard(config, tokenizer, token_size)
+        build_next_shard(config, tokenizer, token_size, source_stream_states)
 
 
 def start_shard_producer(config: Dict[str, Any], config_path: str) -> subprocess.Popen:
@@ -2519,11 +2577,36 @@ def stop_shard_producer(process: Optional[subprocess.Popen]) -> None:
         log_file.close()
 
 
+def last_nonempty_log_line(path: Path, max_bytes: int = 8192) -> str:
+    if not path.exists():
+        return ""
+    try:
+        with path.open("rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - max_bytes), os.SEEK_SET)
+            text = f.read().decode("utf-8", errors="replace")
+    except OSError:
+        return ""
+    for line in reversed(text.splitlines()):
+        line = line.strip()
+        if line:
+            return line[-500:]
+    return ""
+
+
 def wait_for_produced_shard(
     config: Dict[str, Any],
     producer: Optional[subprocess.Popen],
 ) -> Optional[Dict[str, Any]]:
     poll_seconds = max(1.0, float(config["training"].get("shard_producer_poll_seconds", 15.0)))
+    status_seconds = max(
+        poll_seconds,
+        float(config["training"].get("shard_wait_status_seconds", 60.0)),
+    )
+    wait_started = time.monotonic()
+    last_status = wait_started - status_seconds
+    producer_log_path = shard_producer_log_path(config)
     while True:
         manifest = load_manifest(Path(config["paths"]["manifest_path"]))
         shard = next_shard_to_train(manifest)
@@ -2551,6 +2634,21 @@ def wait_for_produced_shard(
                         flush=True,
                     )
                 return None
+        now = time.monotonic()
+        if rank0() and now - last_status >= status_seconds:
+            log_line = last_nonempty_log_line(producer_log_path)
+            print(
+                "Waiting for shard producer "
+                f"pid={producer.pid if producer is not None else 'none'} "
+                f"elapsed={now - wait_started:.0f}s "
+                f"tokens_prepared={int(manifest.get('tokens_prepared', 0)):,} "
+                f"queued_shards={count_prefetch_shards(manifest)} "
+                f"log={producer_log_path}",
+                flush=True,
+            )
+            if log_line:
+                print(f"  producer: {log_line}", flush=True)
+            last_status = now
         time.sleep(poll_seconds)
 
 

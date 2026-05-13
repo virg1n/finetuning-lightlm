@@ -107,6 +107,7 @@
     "shard_build_timeout_seconds": 0,
     "source_stall_warn_seconds": 300,
     "shard_producer_poll_seconds": 15,
+    "shard_wait_status_seconds": 60,
     "shard_producer_log_enabled": true,
     "delete_shard_after_train": true
   },
@@ -152,6 +153,7 @@
   "data": {
     "hf_token": null,
     "stream_shuffle_buffer": 10000,
+    "skip_before_shuffle": true,
     "stream_max_retries": 20,
     "stream_retry_initial_seconds": 5.0,
     "stream_retry_max_seconds": 120.0,
