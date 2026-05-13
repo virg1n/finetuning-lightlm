@@ -601,26 +601,44 @@ def load_state_into_model(model: Transformer, checkpoint: Dict[str, Any]) -> Dic
 def init_special_embeddings(
     model: Transformer,
     tokenizer: AutoTokenizer,
-    old_vocab_size: int,
+    initialized_vocab_size: int,
     special_cfg: Dict[str, Any],
-) -> None:
+) -> List[str]:
     seed_words = special_cfg.get("init_seed_words", {})
     weight = model.tokens_embedding.weight.data
-    base_mean = weight[:old_vocab_size].mean(dim=0)
+    initialized_vocab_size = max(1, min(int(initialized_vocab_size), weight.size(0)))
+    base_mean = weight[:initialized_vocab_size].mean(dim=0)
+    initialized_tokens: List[str] = []
 
     for token in special_cfg["additional_special_tokens"]:
         token_id = tokenizer.convert_tokens_to_ids(token)
-        if token_id is None or token_id < old_vocab_size:
+        if token_id is None or token_id < initialized_vocab_size:
             continue
         related_ids: List[int] = []
         for word in seed_words.get(token, []):
             related_ids.extend(
-                i for i in tokenizer.encode(word, add_special_tokens=False) if 0 <= i < old_vocab_size
+                i for i in tokenizer.encode(word, add_special_tokens=False) if 0 <= i < initialized_vocab_size
             )
         if related_ids:
             weight[token_id].copy_(weight[related_ids].mean(dim=0))
         else:
             weight[token_id].copy_(base_mean)
+        initialized_tokens.append(token)
+    return initialized_tokens
+
+
+def checkpoint_loaded_vocab_rows(info: Dict[str, Any], target_vocab_size: int) -> int:
+    partial = info.get("partial_tensors", {})
+    loaded_rows = [
+        int(details["loaded_rows"])
+        for name, details in partial.items()
+        if name in {"tokens_embedding.weight", "ll_head.weight"}
+        and isinstance(details, dict)
+        and "loaded_rows" in details
+    ]
+    if loaded_rows:
+        return min(max(loaded_rows), target_vocab_size)
+    return target_vocab_size
 
 
 def build_tokenizer(config: Dict[str, Any]) -> Tuple[Any, int]:
@@ -650,19 +668,36 @@ def build_tokenizer_and_model(config: Dict[str, Any], device: torch.device) -> T
     if resume_path:
         checkpoint = torch.load(resume_path, map_location="cpu", weights_only=False)
         info = load_state_into_model(model, checkpoint)
+        loaded_vocab_rows = checkpoint_loaded_vocab_rows(info, len(tokenizer))
+        initialized_tokens = init_special_embeddings(
+            model,
+            tokenizer,
+            loaded_vocab_rows,
+            config["special_tokens"],
+        )
         if rank0():
             print(f"Resumed CPT checkpoint: {resume_path}")
             print(f"Loaded tensors: {info['compatible_tensors']}, partial: {info['partial_tensors']}")
+            if initialized_tokens:
+                print(
+                    "Initialized new special-token embeddings after resize: "
+                    + ", ".join(initialized_tokens)
+                )
     else:
         base_checkpoint = load_checkpoint_file(
             config["model"]["base_checkpoint"],
             config["model"].get("base_checkpoint_subfolder", ""),
         )
         info = load_state_into_model(model, base_checkpoint)
-        init_special_embeddings(model, tokenizer, old_vocab_size, config["special_tokens"])
+        initialized_tokens = init_special_embeddings(model, tokenizer, old_vocab_size, config["special_tokens"])
         if rank0():
             print(f"Loaded base checkpoint: {config['model']['base_checkpoint']}")
             print(f"Loaded tensors: {info['compatible_tensors']}, partial: {info['partial_tensors']}")
+            if initialized_tokens:
+                print(
+                    "Initialized special-token embeddings: "
+                    + ", ".join(initialized_tokens)
+                )
 
     model.to(device)
     return tokenizer, model, old_vocab_size
@@ -2149,6 +2184,36 @@ def load_resume_state(config: Dict[str, Any]) -> Dict[str, Any]:
     return checkpoint
 
 
+def optimizer_state_is_compatible(
+    optimizer: torch.optim.Optimizer,
+    optimizer_state: Dict[str, Any],
+) -> Tuple[bool, str]:
+    saved_groups = optimizer_state.get("param_groups", [])
+    saved_state = optimizer_state.get("state", {})
+    current_groups = optimizer.param_groups
+    if len(saved_groups) != len(current_groups):
+        return False, "different number of optimizer parameter groups"
+
+    for group_idx, (saved_group, current_group) in enumerate(zip(saved_groups, current_groups)):
+        saved_params = list(saved_group.get("params", []))
+        current_params = list(current_group.get("params", []))
+        if len(saved_params) != len(current_params):
+            return False, f"parameter count changed in optimizer group {group_idx}"
+        for param_idx, (saved_param_id, current_param) in enumerate(zip(saved_params, current_params)):
+            state_for_param = saved_state.get(saved_param_id, {})
+            for state_name, state_value in state_for_param.items():
+                if not torch.is_tensor(state_value) or state_value.ndim == 0:
+                    continue
+                if tuple(state_value.shape) != tuple(current_param.shape):
+                    return (
+                        False,
+                        "optimizer tensor shape mismatch at "
+                        f"group {group_idx} param {param_idx} state {state_name}: "
+                        f"checkpoint={tuple(state_value.shape)} current={tuple(current_param.shape)}",
+                    )
+    return True, ""
+
+
 def export_eval_model(
     config: Dict[str, Any],
     tokenizer: Any,
@@ -3038,7 +3103,11 @@ def main() -> None:
     )
     resume_state = load_resume_state(config)
     if resume_state.get("optimizer"):
-        optimizer.load_state_dict(resume_state["optimizer"])
+        optimizer_ok, optimizer_reason = optimizer_state_is_compatible(optimizer, resume_state["optimizer"])
+        if optimizer_ok:
+            optimizer.load_state_dict(resume_state["optimizer"])
+        elif rank0():
+            print(f"Skipped optimizer resume: {optimizer_reason}")
 
     def startup_rank0_stage() -> None:
         output_dir = Path(config["paths"]["output_dir"])

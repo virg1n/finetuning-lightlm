@@ -3,7 +3,7 @@ import copy
 import json
 import sys
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import torch
 import torch.nn.functional as F
@@ -19,6 +19,84 @@ from cont_pretrain import build_tokenizer_and_model, get_dtype  # noqa: E402
 def read_json(path: Path) -> Dict[str, Any]:
     with path.open("r", encoding="utf-8") as f:
         return json.load(f)
+
+
+def resolve_path(value: str, base: Path) -> Path:
+    path = Path(value)
+    if path.is_absolute():
+        return path
+    return (base / path).resolve()
+
+
+def latest_checkpoint(checkpoint_dir: Path) -> Optional[Path]:
+    if not checkpoint_dir.exists():
+        return None
+    checkpoints = sorted(checkpoint_dir.glob("cpt_step_*.pt"))
+    return checkpoints[-1] if checkpoints else None
+
+
+def best_checkpoint(checkpoint_dir: Path) -> Optional[Path]:
+    path = checkpoint_dir / "cpt_best.pt"
+    return path if path.exists() else None
+
+
+def checkpoint_config_hints(current_config: str, current_checkpoint_dir: Path) -> List[str]:
+    hints: List[str] = []
+    for config_path in sorted(REPO_ROOT.glob("config*.json")):
+        try:
+            candidate = read_json(config_path)
+            candidate_dir = resolve_path(candidate["paths"]["checkpoint_dir"], REPO_ROOT)
+        except (KeyError, OSError, json.JSONDecodeError):
+            continue
+        if candidate_dir == current_checkpoint_dir:
+            continue
+        latest = latest_checkpoint(candidate_dir)
+        best = best_checkpoint(candidate_dir)
+        if latest is None and best is None:
+            continue
+        checkpoint_name = latest.name if latest is not None else best.name
+        hints.append(
+            f"{config_path.name}: checkpoint_dir={candidate_dir} newest={checkpoint_name}"
+        )
+    if hints:
+        return [
+            f"Current config is {current_config!r}; other configs with checkpoints:",
+            *hints,
+        ]
+    return [f"Current config is {current_config!r}."]
+
+
+def no_checkpoint_error(config_name: str, checkpoint_dir: Path) -> RuntimeError:
+    lines = [
+        f"No cpt_step_*.pt files found in {checkpoint_dir}",
+        *checkpoint_config_hints(config_name, checkpoint_dir),
+        "Pass the matching config, for example --config config_ffn.json, "
+        "or pass an explicit checkpoint path.",
+    ]
+    best = best_checkpoint(checkpoint_dir)
+    if best is not None:
+        lines.append(f"This directory has {best.name}; use --checkpoint best to prompt it.")
+    return RuntimeError("\n".join(lines))
+
+
+def resolve_checkpoint(checkpoint: str, config: Dict[str, Any], config_name: str) -> str:
+    if checkpoint == "base":
+        return ""
+    checkpoint_dir = resolve_path(config["paths"]["checkpoint_dir"], REPO_ROOT)
+    if checkpoint == "latest":
+        latest = latest_checkpoint(checkpoint_dir)
+        if latest is None:
+            raise no_checkpoint_error(config_name, checkpoint_dir)
+        return str(latest)
+    if checkpoint == "best":
+        best = best_checkpoint(checkpoint_dir)
+        if best is None:
+            raise RuntimeError(f"No cpt_best.pt file found in {checkpoint_dir}")
+        return str(best)
+    checkpoint_path = resolve_path(checkpoint, REPO_ROOT)
+    if not checkpoint_path.exists():
+        raise RuntimeError(f"Checkpoint not found: {checkpoint_path}")
+    return str(checkpoint_path)
 
 
 def filter_logits(logits: torch.Tensor, top_k: int, top_p: float) -> torch.Tensor:
@@ -85,7 +163,7 @@ def main() -> int:
     parser.add_argument(
         "--checkpoint",
         default="base",
-        help="'base', 'latest', or a local cpt_step_*.pt path.",
+        help="'base', 'latest', 'best', or a local checkpoint path.",
     )
     parser.add_argument("--max-new-tokens", type=int, default=128)
     parser.add_argument("--temperature", type=float, default=0.2)
@@ -105,8 +183,9 @@ def main() -> int:
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
 
-    config = copy.deepcopy(read_json((Path.cwd() / args.config).resolve()))
-    config["model"]["resume_checkpoint"] = "" if args.checkpoint == "base" else args.checkpoint
+    config_path = resolve_path(args.config, Path.cwd())
+    config = copy.deepcopy(read_json(config_path))
+    config["model"]["resume_checkpoint"] = resolve_checkpoint(args.checkpoint, config, str(args.config))
     config["model"]["use_cache"] = True
 
     device = torch.device(args.device)

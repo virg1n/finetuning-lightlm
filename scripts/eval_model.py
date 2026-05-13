@@ -55,6 +55,50 @@ def latest_checkpoint(checkpoint_dir: Path) -> Optional[Path]:
     return checkpoints[-1] if checkpoints else None
 
 
+def best_checkpoint(checkpoint_dir: Path) -> Optional[Path]:
+    path = checkpoint_dir / "cpt_best.pt"
+    return path if path.exists() else None
+
+
+def checkpoint_config_hints(current_config: str, current_checkpoint_dir: Path) -> List[str]:
+    hints: List[str] = []
+    for config_path in sorted(REPO_ROOT.glob("config*.json")):
+        try:
+            candidate = read_json(config_path)
+            candidate_dir = resolve_path(candidate["paths"]["checkpoint_dir"], REPO_ROOT)
+        except (KeyError, OSError, json.JSONDecodeError):
+            continue
+        if candidate_dir == current_checkpoint_dir:
+            continue
+        latest = latest_checkpoint(candidate_dir)
+        best = best_checkpoint(candidate_dir)
+        if latest is None and best is None:
+            continue
+        checkpoint_name = latest.name if latest is not None else best.name
+        hints.append(
+            f"{config_path.name}: checkpoint_dir={candidate_dir} newest={checkpoint_name}"
+        )
+    if hints:
+        return [
+            f"Current config is {current_config!r}; other configs with checkpoints:",
+            *hints,
+        ]
+    return [f"Current config is {current_config!r}."]
+
+
+def no_checkpoint_error(args: argparse.Namespace, checkpoint_dir: Path) -> RuntimeError:
+    lines = [
+        f"No cpt_step_*.pt files found in {checkpoint_dir}",
+        *checkpoint_config_hints(str(args.config), checkpoint_dir),
+        "Pass the matching config, for example --config config_ffn.json, "
+        "or pass an explicit checkpoint path.",
+    ]
+    best = best_checkpoint(checkpoint_dir)
+    if best is not None:
+        lines.append(f"This directory has {best.name}; use --checkpoint best to evaluate it.")
+    return RuntimeError("\n".join(lines))
+
+
 def scalar_items(mapping: Dict[str, Any]) -> Iterable[Tuple[str, Any]]:
     for key, value in sorted(mapping.items()):
         if isinstance(value, (str, int, float, bool)) or value is None:
@@ -195,18 +239,22 @@ def resolve_eval_model(args: argparse.Namespace, config: Dict[str, Any]) -> str:
         latest = latest_checkpoint(checkpoint_dir)
         if latest is not None:
             checkpoint = str(latest)
+        elif best_checkpoint(checkpoint_dir) is not None:
+            checkpoint = str(best_checkpoint(checkpoint_dir))
         elif (exported_model / "config.json").exists():
             return str(exported_model.resolve())
         else:
-            raise RuntimeError(
-                "No checkpoint or exported eval model found. Pass --model, "
-                "--checkpoint path/to/cpt_step_*.pt, or --checkpoint base."
-            )
+            raise no_checkpoint_error(args, checkpoint_dir)
     elif checkpoint == "latest":
         latest = latest_checkpoint(checkpoint_dir)
         if latest is None:
-            raise RuntimeError(f"No cpt_step_*.pt files found in {checkpoint_dir}")
+            raise no_checkpoint_error(args, checkpoint_dir)
         checkpoint = str(latest)
+    elif checkpoint == "best":
+        best = best_checkpoint(checkpoint_dir)
+        if best is None:
+            raise RuntimeError(f"No cpt_best.pt file found in {checkpoint_dir}")
+        checkpoint = str(best)
     elif checkpoint != "base":
         checkpoint_path = resolve_path(checkpoint, REPO_ROOT)
         if not checkpoint_path.exists():
@@ -307,7 +355,7 @@ def main() -> int:
     parser.add_argument(
         "--checkpoint",
         default="auto",
-        help="'auto', 'latest', 'base', or a local cpt_step_*.pt path. Ignored when --model is set.",
+        help="'auto', 'latest', 'best', 'base', or a local checkpoint path. Ignored when --model is set.",
     )
     parser.add_argument("--export-device", choices=("cpu", "cuda"), default="cpu")
     parser.add_argument(
