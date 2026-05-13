@@ -1044,7 +1044,9 @@ def extract_python_chunk_documents(
     if max_parse_chars > 0 and len(text) > max_parse_chars:
         return [doc]
     try:
-        tree = ast.parse(text)
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", category=SyntaxWarning)
+            tree = ast.parse(text)
     except SyntaxError:
         return [doc]
 
@@ -2987,6 +2989,8 @@ def last_nonempty_log_line(path: Path, max_bytes: int = 8192) -> str:
         return ""
     for line in reversed(text.splitlines()):
         line = line.strip()
+        if "SyntaxWarning: invalid escape sequence" in line:
+            continue
         if line:
             return line[-500:]
     return ""
