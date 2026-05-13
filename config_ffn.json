@@ -16,7 +16,7 @@
     "base_checkpoint": "Virg1n/LightLM",
     "base_checkpoint_subfolder": "Model FFN",
     "tokenizer_name": "HuggingFaceTB/SmolLM-360M",
-    "resume_checkpoint": "",
+    "resume_checkpoint": "latest",
     "variant": "ffn",
     "num_dims": 512,
     "num_heads": 16,

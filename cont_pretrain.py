@@ -641,6 +641,25 @@ def checkpoint_loaded_vocab_rows(info: Dict[str, Any], target_vocab_size: int) -
     return target_vocab_size
 
 
+def validate_training_resume_setting(config: Dict[str, Any]) -> None:
+    resume_setting = config["model"].get("resume_checkpoint", "latest")
+    if resume_setting:
+        return
+    checkpoint_dir = Path(config["paths"]["checkpoint_dir"])
+    latest = find_latest_checkpoint(checkpoint_dir)
+    if latest is None:
+        return
+    if bool(config["model"].get("allow_fresh_start_with_existing_checkpoints", False)):
+        return
+    raise RuntimeError(
+        "model.resume_checkpoint is empty, but existing CPT checkpoints were found in "
+        f"{checkpoint_dir}. This would start training again from the base HF checkpoint. "
+        "Set model.resume_checkpoint to 'latest' to continue, pass an explicit checkpoint path, "
+        "or set model.allow_fresh_start_with_existing_checkpoints=true if this is intentional. "
+        f"Latest checkpoint: {latest}"
+    )
+
+
 def build_tokenizer(config: Dict[str, Any]) -> Tuple[Any, int]:
     tokenizer = AutoTokenizer.from_pretrained(config["model"]["tokenizer_name"], use_fast=True)
     old_vocab_size = len(tokenizer)
@@ -3089,6 +3108,7 @@ def main() -> None:
         "validate_source_access",
         lambda: validate_source_access(config, verify_hf_access=True),
     )
+    validate_training_resume_setting(config)
 
     tokenizer, model, _old_vocab_size = build_tokenizer_and_model(config, device)
     token_size = infer_token_size(len(tokenizer))
