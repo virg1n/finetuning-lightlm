@@ -38,7 +38,7 @@
   },
   "tokens": {
     "target_total_tokens": 40000000000,
-    "shard_target_tokens": 200000000,
+    "shard_target_tokens": 100000000,
     "disk_budget_gb": 70,
     "disk_safety_fraction": 0.9,
     "avg_source_bytes_per_token": 4.0,
@@ -102,7 +102,7 @@
     "log_interval_steps": 10,
     "parallel_shard_building": true,
     "prefetch_shards": 4,
-    "max_parallel_sources": 12,
+    "max_parallel_sources": 8,
     "stream_read_timeout_seconds": 120,
     "shard_build_timeout_seconds": 0,
     "source_stall_warn_seconds": 300,
@@ -205,7 +205,7 @@
       },
       {
         "id": "codeparrot_clean",
-        "enabled": true,
+        "enabled": false,
         "category": "python_code",
         "dataset": "codeparrot/codeparrot-clean",
         "split": "train",
@@ -216,7 +216,7 @@
       },
       {
         "id": "the_stack_jupyter_notebooks",
-        "enabled": true,
+        "enabled": false,
         "category": "python_code",
         "dataset": "bigcode/the-stack-dedup",
         "data_dir": "data/jupyter-notebook",
