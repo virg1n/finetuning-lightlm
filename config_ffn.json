@@ -161,7 +161,7 @@
         "{output_dir}/humaneval_generations_step_{step}.json",
         "--allow_code_execution"
       ],
-      "cwd": "../bigcode-evaluation-harness",
+      "cwd": "../../bigcode-evaluation-harness",
       "eval_model": "{output_dir}"
     }
   },
