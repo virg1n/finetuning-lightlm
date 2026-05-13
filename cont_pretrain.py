@@ -2045,6 +2045,8 @@ def _checkpoint_payload(
     shard_microbatch: int,
     best_loss: float,
     loss_ema: Optional[float],
+    best_humaneval_score: Optional[float] = None,
+    best_humaneval_step: Optional[int] = None,
 ) -> Dict[str, Any]:
     raw_model = model.module if isinstance(model, DDP) else model
     return {
@@ -2056,6 +2058,12 @@ def _checkpoint_payload(
         "shard_microbatch": shard_microbatch,
         "best_loss": float(best_loss),
         "loss_ema": (float(loss_ema) if loss_ema is not None else None),
+        "best_humaneval_score": (
+            float(best_humaneval_score)
+            if best_humaneval_score is not None and math.isfinite(float(best_humaneval_score))
+            else None
+        ),
+        "best_humaneval_step": int(best_humaneval_step) if best_humaneval_step is not None else None,
         "saved_at": utc_now(),
     }
 
@@ -2070,6 +2078,8 @@ def save_checkpoint(
     shard_microbatch: int,
     best_loss: float = float("inf"),
     loss_ema: Optional[float] = None,
+    best_humaneval_score: Optional[float] = None,
+    best_humaneval_step: Optional[int] = None,
 ) -> Path:
     checkpoint_dir = Path(config["paths"]["checkpoint_dir"])
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -2078,6 +2088,7 @@ def save_checkpoint(
         _checkpoint_payload(
             model, optimizer, global_step, tokens_trained,
             shard_id, shard_microbatch, best_loss, loss_ema,
+            best_humaneval_score, best_humaneval_step,
         ),
         path,
     )
@@ -2097,6 +2108,8 @@ def save_best_checkpoint(
     shard_microbatch: int,
     best_loss: float,
     loss_ema: Optional[float],
+    best_humaneval_score: Optional[float] = None,
+    best_humaneval_step: Optional[int] = None,
 ) -> Path:
     checkpoint_dir = Path(config["paths"]["checkpoint_dir"])
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -2105,6 +2118,7 @@ def save_best_checkpoint(
         _checkpoint_payload(
             model, optimizer, global_step, tokens_trained,
             shard_id, shard_microbatch, best_loss, loss_ema,
+            best_humaneval_score, best_humaneval_step,
         ),
         path,
     )
@@ -2299,6 +2313,77 @@ def compact_eval_results(path: Path) -> Optional[Any]:
     return payload
 
 
+def coerce_metric_float(value: Any) -> Optional[float]:
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, (int, float)):
+        score = float(value)
+        return score if math.isfinite(score) else None
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        is_percent = text.endswith("%")
+        if is_percent:
+            text = text[:-1].strip()
+        try:
+            score = float(text)
+        except ValueError:
+            return None
+        if not math.isfinite(score):
+            return None
+        return score / 100.0 if is_percent else score
+    return None
+
+
+def normalize_metric_key(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", value.lower())
+
+
+def find_named_metric(payload: Any, metric_name: str) -> Optional[float]:
+    target = normalize_metric_key(metric_name)
+    aliases = {target}
+    if target == "pass1":
+        aliases.update({"passat1", "passk1"})
+    if isinstance(payload, dict):
+        for key, value in payload.items():
+            if normalize_metric_key(str(key)) in aliases:
+                score = coerce_metric_float(value)
+                if score is not None:
+                    return score
+                nested = find_named_metric(value, metric_name)
+                if nested is not None:
+                    return nested
+        for value in payload.values():
+            nested = find_named_metric(value, metric_name)
+            if nested is not None:
+                return nested
+    elif isinstance(payload, list):
+        for value in payload:
+            nested = find_named_metric(value, metric_name)
+            if nested is not None:
+                return nested
+    return None
+
+
+def extract_eval_score(eval_results: Any, eval_cfg: Dict[str, Any]) -> Optional[float]:
+    if eval_results is None:
+        return None
+    task_name = str(eval_cfg.get("score_task", "humaneval")).lower()
+    metric_name = str(eval_cfg.get("score_metric", "pass@1"))
+    if isinstance(eval_results, dict):
+        task_matches = [
+            value
+            for key, value in eval_results.items()
+            if task_name in str(key).lower()
+        ]
+        for task_payload in task_matches:
+            score = find_named_metric(task_payload, metric_name)
+            if score is not None:
+                return score
+    return find_named_metric(eval_results, metric_name)
+
+
 def run_bigcode_eval(
     config: Dict[str, Any],
     tokenizer: Any,
@@ -2308,13 +2393,17 @@ def run_bigcode_eval(
     checkpoint_path: Optional[Path],
     manifest: Dict[str, Any],
     force: bool = False,
-) -> bool:
+) -> Dict[str, Any]:
     eval_cfg = config["evaluation"]["bigcode_harness"]
     if not eval_cfg.get("enabled", False):
-        return True
+        return {"ok": True, "skipped": True, "score": None, "reason": "disabled"}
+    interval_steps = int(eval_cfg.get("interval_steps", 0))
+    next_eval_step = int(manifest.get("next_eval_step") or interval_steps or 0)
+    if not force and interval_steps > 0 and global_step < next_eval_step:
+        return {"ok": True, "skipped": True, "score": None, "reason": "step_interval"}
     next_eval = int(manifest.get("next_eval_tokens") or eval_cfg.get("interval_tokens", 0))
-    if not force and tokens_trained < next_eval:
-        return True
+    if not force and interval_steps <= 0 and next_eval > 0 and tokens_trained < next_eval:
+        return {"ok": True, "skipped": True, "score": None, "reason": "token_interval"}
 
     eval_model = eval_cfg.get("eval_model", "{output_dir}")
     output_dir = str(Path(config["paths"]["output_dir"]).resolve())
@@ -2366,7 +2455,7 @@ def run_bigcode_eval(
     )
     if not command:
         append_jsonl(log_path, {"event": "bigcode_eval_skipped", "reason": "empty command", "time": utc_now()})
-        return False
+        return {"ok": False, "skipped": True, "score": None, "reason": "empty command"}
 
     cwd = eval_cfg.get("cwd") or None
     if cwd and not (Path(cwd) / "main.py").exists():
@@ -2380,8 +2469,14 @@ def run_bigcode_eval(
                 "time": utc_now(),
             },
         )
-        return False
+        return {"ok": False, "skipped": True, "score": None, "reason": f"main.py not found in cwd: {cwd}"}
     stdout_path = Path(stdout_log_file) if stdout_log_file else None
+    metric_path = Path(metric_output_path)
+    if metric_path.exists():
+        try:
+            metric_path.unlink()
+        except OSError:
+            pass
     env = clean_subprocess_distributed_env(os.environ)
     returncode = run_subprocess_with_bounded_output(
         command,
@@ -2391,7 +2486,8 @@ def run_bigcode_eval(
         stdout_log_mode,
         stdout_log_max_bytes,
     )
-    eval_results = compact_eval_results(Path(metric_output_path))
+    eval_results = compact_eval_results(metric_path)
+    eval_score = extract_eval_score(eval_results, eval_cfg)
     append_jsonl(
         log_path,
         {
@@ -2400,6 +2496,9 @@ def run_bigcode_eval(
             "tokens_trained": tokens_trained,
             "returncode": returncode,
             "result_keys": sorted(eval_results.keys()) if isinstance(eval_results, dict) else None,
+            "score_task": eval_cfg.get("score_task", "humaneval"),
+            "score_metric": eval_cfg.get("score_metric", "pass@1"),
+            "score": eval_score,
             "metric_output_path": metric_output_path,
             "stdout_log_file": stdout_log_file,
             "stdout_log_mode": stdout_log_mode,
@@ -2407,15 +2506,36 @@ def run_bigcode_eval(
         },
     )
     if returncode != 0:
-        return False
-    interval = int(eval_cfg["interval_tokens"])
-    if force and next_eval <= tokens_trained:
-        next_eval = tokens_trained + interval
-    else:
-        while next_eval <= tokens_trained:
-            next_eval += interval
-    manifest["next_eval_tokens"] = next_eval
-    return True
+        return {
+            "ok": False,
+            "skipped": False,
+            "score": eval_score,
+            "returncode": returncode,
+            "metric_output_path": metric_output_path,
+            "stdout_log_file": stdout_log_file,
+        }
+    interval = int(eval_cfg.get("interval_tokens", 0))
+    if interval > 0:
+        if force and next_eval <= tokens_trained:
+            next_eval = tokens_trained + interval
+        else:
+            while next_eval <= tokens_trained:
+                next_eval += interval
+        manifest["next_eval_tokens"] = next_eval
+    if interval_steps > 0:
+        if next_eval_step <= 0:
+            next_eval_step = interval_steps
+        while next_eval_step <= global_step:
+            next_eval_step += interval_steps
+        manifest["next_eval_step"] = next_eval_step
+    return {
+        "ok": True,
+        "skipped": False,
+        "score": eval_score,
+        "returncode": returncode,
+        "metric_output_path": metric_output_path,
+        "stdout_log_file": stdout_log_file,
+    }
 
 
 def mark_shard_status(config: Dict[str, Any], shard_id: int, status: str, **extra: Any) -> None:
@@ -2438,7 +2558,7 @@ def train_shard(
     rank: int,
     world_size: int,
     resume_state: Dict[str, Any],
-) -> Tuple[int, int, float, Optional[float]]:
+) -> Tuple[int, int, float, Optional[float], Optional[int]]:
     tcfg = config["training"]
     global_tokens_per_step = (
         int(tcfg["per_device_batch_size"])
@@ -2449,7 +2569,19 @@ def train_shard(
     total_steps = math.ceil(int(config["tokens"]["target_total_tokens"]) / global_tokens_per_step)
     global_step = int(resume_state.get("global_step", 0))
     tokens_trained = int(resume_state.get("tokens_trained", 0))
-    best_loss = float(resume_state.get("best_loss", float("inf")))
+    best_loss = float(resume_state.get("best_loss", resume_state.get("loss_ema", float("inf"))))
+    best_humaneval_value = resume_state.get("best_humaneval_score")
+    best_humaneval_score = (
+        float(best_humaneval_value)
+        if best_humaneval_value is not None
+        else float("-inf")
+    )
+    best_humaneval_step_value = resume_state.get("best_humaneval_step")
+    best_humaneval_step = (
+        int(best_humaneval_step_value)
+        if best_humaneval_step_value is not None
+        else None
+    )
     loss_ema: Optional[float] = resume_state.get("loss_ema")
     if loss_ema is not None:
         loss_ema = float(loss_ema)
@@ -2470,7 +2602,7 @@ def train_shard(
     if batcher.microbatches == 0:
         if rank0():
             print(f"Shard {shard['id']} has no full training batches.")
-        return global_step, tokens_trained, best_loss, loss_ema
+        return global_step, tokens_trained, best_humaneval_score, loss_ema, best_humaneval_step
 
     dtype = get_dtype(tcfg["dtype"])
     use_amp = device.type == "cuda"
@@ -2564,22 +2696,42 @@ def train_shard(
 
         if global_step % checkpoint_interval == 0:
             def checkpoint_eval_stage() -> None:
-                nonlocal last_checkpoint, best_loss
+                nonlocal last_checkpoint, best_humaneval_score, best_humaneval_step
                 last_checkpoint = save_checkpoint(
                     config, model, optimizer, global_step, tokens_trained,
                     int(shard["id"]), microbatch, best_loss, loss_ema,
+                    best_humaneval_score, best_humaneval_step,
                 )
-                if loss_ema is not None and loss_ema < best_loss:
-                    best_loss = loss_ema
-                    save_best_checkpoint(
-                        config, model, optimizer, global_step, tokens_trained,
-                        int(shard["id"]), microbatch, best_loss, loss_ema,
-                    )
-                    print(f"  new best loss: {best_loss:.4f} (step {global_step}) -> cpt_best.pt")
                 manifest = load_manifest(Path(config["paths"]["manifest_path"]))
                 manifest["global_step"] = global_step
                 manifest["tokens_trained"] = tokens_trained
-                run_bigcode_eval(config, tokenizer, model, global_step, tokens_trained, last_checkpoint, manifest)
+                eval_result = run_bigcode_eval(
+                    config, tokenizer, model, global_step, tokens_trained, last_checkpoint, manifest
+                )
+                score = eval_result.get("score")
+                if eval_result.get("ok") and score is not None and float(score) > best_humaneval_score:
+                    best_humaneval_score = float(score)
+                    best_humaneval_step = global_step
+                    save_best_checkpoint(
+                        config, model, optimizer, global_step, tokens_trained,
+                        int(shard["id"]), microbatch, best_loss, loss_ema,
+                        best_humaneval_score, best_humaneval_step,
+                    )
+                    append_jsonl(
+                        train_log,
+                        {
+                            "event": "new_best_humaneval",
+                            "time": utc_now(),
+                            "step": global_step,
+                            "tokens_trained": tokens_trained,
+                            "score": best_humaneval_score,
+                            "metric_output_path": eval_result.get("metric_output_path"),
+                        },
+                    )
+                    print(
+                        f"  new best HumanEval score: {best_humaneval_score:.4f} "
+                        f"(step {global_step}) -> cpt_best.pt"
+                    )
                 with locked_manifest(config) as current_manifest:
                     current_manifest["global_step"] = global_step
                     current_manifest["tokens_trained"] = tokens_trained
@@ -2587,26 +2739,51 @@ def train_shard(
                         "next_eval_tokens",
                         current_manifest.get("next_eval_tokens", 0),
                     )
+                    current_manifest["next_eval_step"] = manifest.get(
+                        "next_eval_step",
+                        current_manifest.get("next_eval_step", 0),
+                    )
+                    if best_humaneval_step is not None:
+                        current_manifest["best_humaneval_score"] = best_humaneval_score
+                        current_manifest["best_humaneval_step"] = best_humaneval_step
 
             run_rank0_stage(config, f"checkpoint_eval_step_{global_step}", checkpoint_eval_stage)
 
     def final_checkpoint_eval_stage() -> None:
-        nonlocal last_checkpoint, best_loss
+        nonlocal last_checkpoint, best_humaneval_score, best_humaneval_step
         last_checkpoint = save_checkpoint(
             config, model, optimizer, global_step, tokens_trained,
             int(shard["id"]), microbatch, best_loss, loss_ema,
+            best_humaneval_score, best_humaneval_step,
         )
-        if loss_ema is not None and loss_ema < best_loss:
-            best_loss = loss_ema
-            save_best_checkpoint(
-                config, model, optimizer, global_step, tokens_trained,
-                int(shard["id"]), microbatch, best_loss, loss_ema,
-            )
-            print(f"  new best loss: {best_loss:.4f} (step {global_step}) -> cpt_best.pt")
         manifest = load_manifest(Path(config["paths"]["manifest_path"]))
         manifest["global_step"] = global_step
         manifest["tokens_trained"] = tokens_trained
-        run_bigcode_eval(config, tokenizer, model, global_step, tokens_trained, last_checkpoint, manifest)
+        eval_result = run_bigcode_eval(config, tokenizer, model, global_step, tokens_trained, last_checkpoint, manifest)
+        score = eval_result.get("score")
+        if eval_result.get("ok") and score is not None and float(score) > best_humaneval_score:
+            best_humaneval_score = float(score)
+            best_humaneval_step = global_step
+            save_best_checkpoint(
+                config, model, optimizer, global_step, tokens_trained,
+                int(shard["id"]), microbatch, best_loss, loss_ema,
+                best_humaneval_score, best_humaneval_step,
+            )
+            append_jsonl(
+                train_log,
+                {
+                    "event": "new_best_humaneval",
+                    "time": utc_now(),
+                    "step": global_step,
+                    "tokens_trained": tokens_trained,
+                    "score": best_humaneval_score,
+                    "metric_output_path": eval_result.get("metric_output_path"),
+                },
+            )
+            print(
+                f"  new best HumanEval score: {best_humaneval_score:.4f} "
+                f"(step {global_step}) -> cpt_best.pt"
+            )
         with locked_manifest(config) as current_manifest:
             current_manifest["global_step"] = global_step
             current_manifest["tokens_trained"] = tokens_trained
@@ -2614,6 +2791,13 @@ def train_shard(
                 "next_eval_tokens",
                 current_manifest.get("next_eval_tokens", 0),
             )
+            current_manifest["next_eval_step"] = manifest.get(
+                "next_eval_step",
+                current_manifest.get("next_eval_step", 0),
+            )
+            if best_humaneval_step is not None:
+                current_manifest["best_humaneval_score"] = best_humaneval_score
+                current_manifest["best_humaneval_step"] = best_humaneval_step
         append_jsonl(
             train_log,
             {
@@ -2627,7 +2811,7 @@ def train_shard(
         )
 
     run_rank0_stage(config, f"final_checkpoint_eval_shard_{shard['id']}", final_checkpoint_eval_stage)
-    return global_step, tokens_trained, best_loss, loss_ema
+    return global_step, tokens_trained, best_humaneval_score, loss_ema, best_humaneval_step
 
 
 def next_shard_to_train(manifest: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -2874,11 +3058,13 @@ def main() -> None:
 
         manifest_path = Path(config["paths"]["manifest_path"])
         manifest = load_manifest(manifest_path)
+        eval_cfg = config["evaluation"]["bigcode_harness"]
         if (
-            config["evaluation"]["bigcode_harness"].get("enabled", False)
+            eval_cfg.get("enabled", False)
+            and eval_cfg.get("initial_eval_enabled", False)
             and not manifest.get("initial_eval_done", False)
         ):
-            eval_ok = run_bigcode_eval(
+            eval_result = run_bigcode_eval(
                 config,
                 tokenizer,
                 model,
@@ -2888,7 +3074,7 @@ def main() -> None:
                 manifest,
                 force=True,
             )
-            if eval_ok:
+            if eval_result.get("ok"):
                 manifest["initial_eval_done"] = True
                 print("Initial BigCode eval completed.")
             else:
@@ -2899,6 +3085,10 @@ def main() -> None:
                 current_manifest["next_eval_tokens"] = manifest.get(
                     "next_eval_tokens",
                     current_manifest.get("next_eval_tokens", 0),
+                )
+                current_manifest["next_eval_step"] = manifest.get(
+                    "next_eval_step",
+                    current_manifest.get("next_eval_step", 0),
                 )
 
     run_rank0_stage(config, "startup", startup_rank0_stage)
@@ -2947,7 +3137,13 @@ def main() -> None:
             if args.prepare_only:
                 break
 
-            global_step, tokens_trained, best_loss, loss_ema = train_shard(
+            (
+                global_step,
+                tokens_trained,
+                best_humaneval_score,
+                loss_ema,
+                best_humaneval_step,
+            ) = train_shard(
                 config,
                 shard,
                 tokenizer,
@@ -2962,7 +3158,12 @@ def main() -> None:
             resume_state = {
                 "global_step": global_step,
                 "tokens_trained": tokens_trained,
-                "best_loss": best_loss,
+                "best_humaneval_score": (
+                    best_humaneval_score
+                    if math.isfinite(float(best_humaneval_score))
+                    else None
+                ),
+                "best_humaneval_step": best_humaneval_step,
                 "loss_ema": loss_ema,
             }
             barrier()
