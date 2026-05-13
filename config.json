@@ -161,6 +161,19 @@
     "max_empty_examples_per_source": 500000,
     "cycle_on_exhaustion": true,
     "max_source_epochs_per_shard": 16,
+    "python_chunking": {
+      "enabled": true,
+      "split_probability": 0.25,
+      "emit_top_level_functions": true,
+      "emit_methods": true,
+      "emit_classes": false,
+      "include_import_context": true,
+      "import_context_max_chars": 4000,
+      "min_chunk_chars": 0,
+      "max_chunk_chars": 24000,
+      "max_parse_chars": 200000,
+      "max_chunks_per_file": 32
+    },
     "english_filter": {
       "enabled": true,
       "min_ascii_ratio": 0.85,

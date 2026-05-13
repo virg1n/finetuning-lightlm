@@ -1,4 +1,5 @@
 import argparse
+import ast
 import gzip
 import hashlib
 import html
@@ -909,6 +910,148 @@ def extract_python_notebook(text: str) -> str:
     return "\n\n".join(cells)
 
 
+def _node_start_lineno(node: ast.AST) -> int:
+    lineno = int(getattr(node, "lineno", 1))
+    decorators = getattr(node, "decorator_list", None) or []
+    for decorator in decorators:
+        lineno = min(lineno, int(getattr(decorator, "lineno", lineno)))
+    return lineno
+
+
+def _node_end_lineno(node: ast.AST) -> int:
+    return int(getattr(node, "end_lineno", getattr(node, "lineno", 1)))
+
+
+def _source_slice(lines: List[str], start_lineno: int, end_lineno: int) -> str:
+    start = max(0, start_lineno - 1)
+    end = min(len(lines), max(start, end_lineno))
+    return "".join(lines[start:end]).rstrip() + "\n"
+
+
+def is_python_code_document(doc: Dict[str, Any], source: Dict[str, Any]) -> bool:
+    if doc.get("category") != "python_code":
+        return False
+    path = str(doc.get("path") or "").lower()
+    if path.endswith(".py") or path.endswith(".pyi") or path.endswith(".ipynb"):
+        return True
+    values = [doc.get("language"), doc.get("lang"), source.get("language")]
+    values.extend(source.get("languages", []))
+    return any("python" in normalize_language(value) for value in values if value)
+
+
+def python_chunking_config(source: Dict[str, Any], config: Dict[str, Any]) -> Dict[str, Any]:
+    chunk_cfg = dict(config.get("data", {}).get("python_chunking", {}))
+    chunk_cfg.update(source.get("python_chunking", {}))
+    return chunk_cfg
+
+
+def python_import_context(tree: ast.Module, lines: List[str], max_chars: int) -> str:
+    if max_chars <= 0:
+        return ""
+    parts = []
+    for node in tree.body:
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            parts.append(_source_slice(lines, _node_start_lineno(node), _node_end_lineno(node)))
+    context = "".join(parts).strip()
+    if not context:
+        return ""
+    if len(context) > max_chars:
+        context = context[:max_chars].rstrip()
+    return context + "\n\n"
+
+
+def class_header_context(lines: List[str], node: ast.ClassDef) -> str:
+    start_lineno = _node_start_lineno(node)
+    if node.body:
+        end_lineno = max(start_lineno, _node_start_lineno(node.body[0]) - 1)
+    else:
+        end_lineno = start_lineno
+    header = _source_slice(lines, start_lineno, end_lineno)
+    if node.body and isinstance(node.body[0], ast.Expr):
+        value = getattr(node.body[0], "value", None)
+        if isinstance(value, ast.Constant) and isinstance(value.value, str):
+            header += _source_slice(lines, _node_start_lineno(node.body[0]), _node_end_lineno(node.body[0]))
+    return header
+
+
+def make_python_chunk_doc(
+    base_doc: Dict[str, Any],
+    text: str,
+    chunk_type: str,
+) -> Dict[str, Any]:
+    doc = dict(base_doc)
+    doc["text"] = text
+    doc["language"] = "Python"
+    doc["chunk_type"] = chunk_type
+    return doc
+
+
+def extract_python_chunk_documents(
+    doc: Dict[str, Any],
+    source: Dict[str, Any],
+    config: Dict[str, Any],
+    rng: Optional[random.Random] = None,
+) -> List[Dict[str, Any]]:
+    chunk_cfg = python_chunking_config(source, config)
+    if not chunk_cfg.get("enabled", False) or not is_python_code_document(doc, source):
+        return [doc]
+
+    split_probability = float(chunk_cfg.get("split_probability", 0.35))
+    if split_probability <= 0.0:
+        return [doc]
+    if split_probability < 1.0:
+        sampler = rng if rng is not None else random
+        if sampler.random() >= split_probability:
+            return [doc]
+
+    text = doc.get("text") or ""
+    max_parse_chars = int(chunk_cfg.get("max_parse_chars", 200_000))
+    if max_parse_chars > 0 and len(text) > max_parse_chars:
+        return [doc]
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        return [doc]
+
+    lines = text.splitlines(keepends=True)
+    min_chars = int(chunk_cfg.get("min_chunk_chars", config["data"].get("min_doc_chars", 32)))
+    max_chars = int(chunk_cfg.get("max_chunk_chars", 24_000))
+    max_chunks = max(0, int(chunk_cfg.get("max_chunks_per_file", 32)))
+    include_imports = bool(chunk_cfg.get("include_import_context", True))
+    import_context = (
+        python_import_context(tree, lines, int(chunk_cfg.get("import_context_max_chars", 4_000)))
+        if include_imports
+        else ""
+    )
+    chunks: List[Dict[str, Any]] = []
+
+    def maybe_add(segment: str, chunk_type: str) -> None:
+        if max_chunks and len(chunks) >= max_chunks:
+            return
+        segment = segment.strip()
+        if len(segment) < min_chars or len(segment) > max_chars:
+            return
+        chunks.append(make_python_chunk_doc(doc, segment + "\n", chunk_type))
+
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if chunk_cfg.get("emit_top_level_functions", True):
+                segment = import_context + _source_slice(lines, _node_start_lineno(node), _node_end_lineno(node))
+                maybe_add(segment, "python_function")
+        elif isinstance(node, ast.ClassDef):
+            if chunk_cfg.get("emit_classes", False):
+                segment = import_context + _source_slice(lines, _node_start_lineno(node), _node_end_lineno(node))
+                maybe_add(segment, "python_class")
+            if chunk_cfg.get("emit_methods", True):
+                class_header = class_header_context(lines, node)
+                for child in node.body:
+                    if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        method = _source_slice(lines, _node_start_lineno(child), _node_end_lineno(child))
+                        maybe_add(import_context + class_header + method, "python_method")
+
+    return chunks or [doc]
+
+
 def strip_html(text: str) -> str:
     text = re.sub(r"<pre><code>(.*?)</code></pre>", r"\n\1\n", text, flags=re.DOTALL | re.IGNORECASE)
     text = re.sub(r"<code>(.*?)</code>", r"`\1`", text, flags=re.DOTALL | re.IGNORECASE)
@@ -992,6 +1135,8 @@ def row_to_documents(
     row: Dict[str, Any],
     source: Dict[str, Any],
     swh_client: Optional[SWHContentClient],
+    config: Dict[str, Any],
+    rng: Optional[random.Random] = None,
 ) -> Iterator[Dict[str, Any]]:
     if source.get("content_loader") == "stack_v2_swh":
         if swh_client is None:
@@ -1014,7 +1159,7 @@ def row_to_documents(
                     print(f"Skipping SWH blob {file_info.get('blob_id')} after error: {exc}")
                 continue
             doc["text"] = text
-            yield doc
+            yield from extract_python_chunk_documents(doc, source, config, rng)
         return
 
     path_field = source.get("path_field")
@@ -1035,7 +1180,7 @@ def row_to_documents(
         "language": row.get("language") or row.get("lang"),
         "source_id": source["id"],
     }
-    yield doc
+    yield from extract_python_chunk_documents(doc, source, config, rng)
 
 
 def looks_english(text: str, config: Dict[str, Any]) -> bool:
@@ -1055,7 +1200,10 @@ def looks_english(text: str, config: Dict[str, Any]) -> bool:
 
 def keep_document(doc: Dict[str, Any], source: Dict[str, Any], config: Dict[str, Any]) -> bool:
     text = doc.get("text") or ""
-    if len(text) < int(config["data"].get("min_doc_chars", 32)):
+    min_chars = int(config["data"].get("min_doc_chars", 32))
+    if doc.get("chunk_type") and doc.get("category") == "python_code":
+        min_chars = int(python_chunking_config(source, config).get("min_chunk_chars", min_chars))
+    if len(text) < min_chars:
         return False
     category = source["category"]
     if category in CODE_CATEGORIES and not language_matches(doc, source):
@@ -1365,7 +1513,7 @@ def _consume_source(
                     f"{source_examples:,} streamed examples. Check text_field/content_processor "
                     f"for this dataset. Last row keys: {keys}"
                 )
-            for doc in row_to_documents(row, source, swh_client):
+            for doc in row_to_documents(row, source, swh_client, config, rng):
                 if not keep_document(doc, source, config):
                     continue
                 with counter_lock:
