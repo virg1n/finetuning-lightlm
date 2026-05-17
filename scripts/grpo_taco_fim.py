@@ -10,6 +10,11 @@ import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+os.environ.setdefault("TRANSFORMERS_NO_TF", "1")
+os.environ.setdefault("TRANSFORMERS_NO_FLAX", "1")
+os.environ.setdefault("USE_TF", "0")
+os.environ.setdefault("USE_FLAX", "0")
+
 from accelerate import PartialState
 from datasets import Dataset, load_dataset
 from huggingface_hub import hf_hub_download, list_repo_files
@@ -41,6 +46,7 @@ import io
 import json
 import math
 import os
+from pathlib import Path
 import subprocess
 import sys
 import time
@@ -260,6 +266,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-steps", type=int, default=1000)
     parser.add_argument("--per-device-train-batch-size", type=int, default=8)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=4)
+    parser.add_argument(
+        "--steps-per-generation",
+        type=int,
+        default=1,
+        help=(
+            "How many local train batches to generate at once. TRL defaults this to "
+            "gradient_accumulation_steps, which can OOM during generation for long code prompts."
+        ),
+    )
     parser.add_argument("--gradient-checkpointing", action="store_true")
     parser.add_argument("--bf16", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--seed", type=int, default=1338)
@@ -568,10 +583,10 @@ class TacoUnitTestReward:
 
 
 def validate_batch_geometry(args: argparse.Namespace) -> None:
-    effective = args.per_device_train_batch_size * args.gradient_accumulation_steps
+    effective = args.per_device_train_batch_size * max(1, args.steps_per_generation)
     if effective % args.group_size != 0:
         raise ValueError(
-            "per_device_train_batch_size * gradient_accumulation_steps must be divisible "
+            "per_device_train_batch_size * steps_per_generation must be divisible "
             f"by group_size. Got {effective} and group_size={args.group_size}."
         )
 
@@ -703,6 +718,7 @@ def build_grpo_config(
         "weight_decay": args.weight_decay,
         "per_device_train_batch_size": args.per_device_train_batch_size,
         "gradient_accumulation_steps": args.gradient_accumulation_steps,
+        "steps_per_generation": args.steps_per_generation,
         "gradient_checkpointing": args.gradient_checkpointing,
         "bf16": args.bf16,
         "logging_steps": args.logging_steps,
