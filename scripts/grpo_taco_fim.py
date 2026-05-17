@@ -9,7 +9,9 @@ import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+from accelerate import PartialState
 from datasets import Dataset, load_dataset
+from huggingface_hub import hf_hub_download, list_repo_files
 from transformers import AutoTokenizer
 from trl import GRPOConfig, GRPOTrainer
 
@@ -210,6 +212,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", required=True, help="HF model id or local exported model directory.")
     parser.add_argument("--tokenizer", default=None, help="Tokenizer path/id. Defaults to --model.")
     parser.add_argument("--dataset-name", default="BAAI/TACO")
+    parser.add_argument("--dataset-revision", default=None)
     parser.add_argument("--split", default="train")
     parser.add_argument("--output-dir", default="rl_runs/lightlm-taco-grpo-fim")
     parser.add_argument("--max-train-samples", type=int, default=0)
@@ -318,12 +321,60 @@ def build_fim_parts(example: Dict[str, Any]) -> Tuple[str, str]:
     return prefix, suffix
 
 
-def prepare_taco_dataset(args: argparse.Namespace) -> Dataset:
-    dataset = load_dataset(
-        args.dataset_name,
-        split=args.split,
-        trust_remote_code=args.trust_remote_code,
+def base_split_name(split: str) -> str:
+    return split.split("[", 1)[0].strip() or split
+
+
+def load_taco_arrow_dataset(args: argparse.Namespace) -> Dataset:
+    split_name = base_split_name(args.split)
+    prefix = f"{split_name}/"
+    files = list_repo_files(
+        repo_id=args.dataset_name,
+        repo_type="dataset",
+        revision=args.dataset_revision,
     )
+    arrow_files = sorted(
+        filename
+        for filename in files
+        if filename.startswith(prefix) and filename.endswith(".arrow")
+    )
+    if not arrow_files:
+        raise RuntimeError(
+            f"No Arrow files found for split {split_name!r} in dataset {args.dataset_name!r}."
+        )
+    local_files = [
+        hf_hub_download(
+            repo_id=args.dataset_name,
+            filename=filename,
+            repo_type="dataset",
+            revision=args.dataset_revision,
+        )
+        for filename in arrow_files
+    ]
+    return load_dataset("arrow", data_files={split_name: local_files}, split=args.split)
+
+
+def load_taco_dataset(args: argparse.Namespace) -> Dataset:
+    try:
+        return load_dataset(
+            args.dataset_name,
+            split=args.split,
+            revision=args.dataset_revision,
+        )
+    except RuntimeError as exc:
+        message = str(exc)
+        if "Dataset scripts are no longer supported" not in message and "TACO.py" not in message:
+            raise
+        print(
+            "datasets cannot execute BAAI/TACO.py in this environment; "
+            "loading TACO Arrow shards directly from the Hub.",
+            flush=True,
+        )
+        return load_taco_arrow_dataset(args)
+
+
+def prepare_taco_dataset(args: argparse.Namespace) -> Dataset:
+    dataset = load_taco_dataset(args)
     if args.max_train_samples and args.max_train_samples > 0:
         dataset = dataset.select(range(min(args.max_train_samples, len(dataset))))
 
@@ -504,7 +555,9 @@ def report_to_value(value: str) -> Any:
 def main() -> int:
     args = parse_args()
     validate_batch_geometry(args)
-    train_dataset = prepare_taco_dataset(args)
+    distributed_state = PartialState()
+    with distributed_state.main_process_first():
+        train_dataset = prepare_taco_dataset(args)
 
     tokenizer = AutoTokenizer.from_pretrained(
         args.tokenizer or args.model,
