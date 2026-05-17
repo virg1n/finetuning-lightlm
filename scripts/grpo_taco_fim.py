@@ -677,6 +677,7 @@ def build_grpo_config(args: argparse.Namespace, state: PartialState) -> GRPOConf
 
 def build_grpo_trainer(
     model: Any,
+    ref_model: Any,
     reward_func: TacoUnitTestReward,
     training_args: GRPOConfig,
     train_dataset: Dataset,
@@ -689,6 +690,8 @@ def build_grpo_trainer(
         "train_dataset": train_dataset,
     }
     supported = supported_init_kwargs(GRPOTrainer.__init__)
+    if supported is None or "ref_model" in supported:
+        kwargs["ref_model"] = ref_model
     if supported is None or "processing_class" in supported:
         kwargs["processing_class"] = tokenizer
     elif "tokenizer" in supported:
@@ -722,10 +725,18 @@ def main() -> int:
         args.model,
         **model_load_kwargs,
     )
+    ref_model = AutoModelForCausalLM.from_pretrained(
+        args.model,
+        **model_load_kwargs,
+    )
+    ref_model.eval()
+    for param in ref_model.parameters():
+        param.requires_grad_(False)
     training_args = build_grpo_config(args, distributed_state)
 
     trainer = build_grpo_trainer(
         model=model,
+        ref_model=ref_model,
         reward_func=TacoUnitTestReward(
             timeout_seconds=args.reward_timeout_seconds,
             memory_limit_mb=args.memory_limit_mb,
