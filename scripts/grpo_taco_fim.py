@@ -19,6 +19,19 @@ from trl import GRPOConfig, GRPOTrainer
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
+def disable_python_int_digit_limit() -> None:
+    setter = getattr(sys, "set_int_max_str_digits", None)
+    if setter is None:
+        return
+    try:
+        setter(0)
+    except ValueError:
+        pass
+
+
+disable_python_int_digit_limit()
+
+
 RUNNER_CODE = r'''
 import ast
 import io
@@ -34,6 +47,19 @@ try:
     import resource
 except ImportError:
     resource = None
+
+
+def disable_python_int_digit_limit():
+    setter = getattr(sys, "set_int_max_str_digits", None)
+    if setter is None:
+        return
+    try:
+        setter(0)
+    except ValueError:
+        pass
+
+
+disable_python_int_digit_limit()
 
 
 def apply_limits(memory_limit_mb):
@@ -264,7 +290,7 @@ def parse_input_output(value: Any) -> Optional[Dict[str, Any]]:
             return None
         try:
             payload = json.loads(text)
-        except json.JSONDecodeError:
+        except ValueError:
             return None
     elif isinstance(value, dict):
         payload = value
