@@ -620,12 +620,38 @@ def patch_trl_causal_lm_loader(default_kwargs: Dict[str, Any]) -> None:
             load_kwargs["dtype"] = getattr(torch, dtype)
         load_kwargs.setdefault("trust_remote_code", True)
         model_cls = architecture or AutoModelForCausalLM
-        return model_cls.from_pretrained(model_id, **load_kwargs)
+        model = model_cls.from_pretrained(model_id, **load_kwargs)
+        patch_lightlm_transformers_compat(model)
+        return model
 
     for module_name in ("trl.trainer.grpo_trainer", "trl.trainer.utils"):
         module = sys.modules.get(module_name)
         if module is not None and hasattr(module, "create_model_from_path"):
             setattr(module, "create_model_from_path", create_causal_lm_from_path)
+
+
+def patch_lightlm_transformers_compat(model: Any) -> None:
+    config = getattr(model, "config", None)
+    if config is not None and getattr(config, "model_type", None) == "lightlm":
+        aliases = {
+            "num_hidden_layers": "num_layers",
+            "hidden_size": "num_dims",
+            "num_attention_heads": "num_heads",
+            "num_key_value_heads": "num_kv_heads",
+            "intermediate_size": "ffn_hidden_dims",
+            "max_position_embeddings": "context_len",
+        }
+        for target, source in aliases.items():
+            if not hasattr(config, target) and hasattr(config, source):
+                setattr(config, target, getattr(config, source))
+
+    # LightLM's exported HF wrapper returns legacy tuple KV caches. Newer
+    # Transformers otherwise tries to create DynamicCache objects for generate().
+    if config is not None and getattr(config, "model_type", None) == "lightlm":
+        model._supports_cache_class = False
+        generation_config = getattr(model, "generation_config", None)
+        if generation_config is not None:
+            generation_config.cache_implementation = None
 
 
 def build_model_load_kwargs(args: argparse.Namespace) -> Dict[str, Any]:
@@ -635,17 +661,6 @@ def build_model_load_kwargs(args: argparse.Namespace) -> Dict[str, Any]:
     if args.bf16:
         kwargs["dtype"] = torch.bfloat16
     return kwargs
-
-
-def serializable_model_init_kwargs(kwargs: Dict[str, Any]) -> Dict[str, Any]:
-    init_kwargs = dict(kwargs)
-    if init_kwargs.get("dtype") is torch.bfloat16:
-        init_kwargs["dtype"] = "bfloat16"
-    elif init_kwargs.get("dtype") is torch.float16:
-        init_kwargs["dtype"] = "float16"
-    elif init_kwargs.get("dtype") is torch.float32:
-        init_kwargs["dtype"] = "float32"
-    return init_kwargs
 
 
 def filter_supported_kwargs(
@@ -680,7 +695,6 @@ def filter_supported_kwargs(
 def build_grpo_config(
     args: argparse.Namespace,
     state: PartialState,
-    model_init_kwargs: Dict[str, Any],
 ) -> GRPOConfig:
     kwargs = {
         "output_dir": args.output_dir,
@@ -690,7 +704,6 @@ def build_grpo_config(
         "per_device_train_batch_size": args.per_device_train_batch_size,
         "gradient_accumulation_steps": args.gradient_accumulation_steps,
         "gradient_checkpointing": args.gradient_checkpointing,
-        "model_init_kwargs": model_init_kwargs,
         "bf16": args.bf16,
         "logging_steps": args.logging_steps,
         "save_steps": args.save_steps,
@@ -775,20 +788,18 @@ def main() -> int:
         args.model,
         **model_load_kwargs,
     )
+    patch_lightlm_transformers_compat(model)
     ref_model: Optional[Any] = None
     if trainer_supports_ref_model():
         ref_model = AutoModelForCausalLM.from_pretrained(
             args.model,
             **model_load_kwargs,
         )
+        patch_lightlm_transformers_compat(ref_model)
         ref_model.eval()
         for param in ref_model.parameters():
             param.requires_grad_(False)
-    training_args = build_grpo_config(
-        args,
-        distributed_state,
-        serializable_model_init_kwargs(model_load_kwargs),
-    )
+    training_args = build_grpo_config(args, distributed_state)
 
     trainer = build_grpo_trainer(
         model=model,
