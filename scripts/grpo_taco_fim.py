@@ -1,4 +1,5 @@
 import argparse
+import inspect
 import json
 import os
 import re
@@ -12,7 +13,9 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 from accelerate import PartialState
 from datasets import Dataset, load_dataset
 from huggingface_hub import hf_hub_download, list_repo_files
-from transformers import AutoTokenizer
+import torch
+import trl
+from transformers import AutoModelForCausalLM, AutoTokenizer
 from trl import GRPOConfig, GRPOTrainer
 
 
@@ -578,7 +581,122 @@ def report_to_value(value: str) -> Any:
     return [part.strip() for part in value.split(",") if part.strip()]
 
 
+def set_process_cuda_device() -> None:
+    local_rank = os.environ.get("LOCAL_RANK")
+    if local_rank is None or not torch.cuda.is_available():
+        return
+    try:
+        torch.cuda.set_device(int(local_rank))
+    except (TypeError, ValueError, RuntimeError):
+        pass
+
+
+def supported_init_kwargs(cls: Any) -> Optional[set]:
+    signature = inspect.signature(cls)
+    params = signature.parameters
+    if any(param.kind == inspect.Parameter.VAR_KEYWORD for param in params.values()):
+        return None
+    return set(params)
+
+
+def filter_supported_kwargs(
+    cls: Any,
+    kwargs: Dict[str, Any],
+    required: Sequence[str],
+    state: PartialState,
+    owner_name: str,
+) -> Dict[str, Any]:
+    supported = supported_init_kwargs(cls)
+    if supported is None:
+        return kwargs
+    missing_required = [name for name in required if name not in supported]
+    if missing_required:
+        version = getattr(trl, "__version__", "unknown")
+        raise RuntimeError(
+            f"Installed TRL {version} has an incompatible {owner_name}; "
+            f"missing required argument(s): {', '.join(missing_required)}. "
+            "Upgrade with: pip install -U 'trl>=0.17.0'"
+        )
+    unsupported = sorted(name for name in kwargs if name not in supported)
+    if unsupported and state.is_main_process:
+        version = getattr(trl, "__version__", "unknown")
+        print(
+            f"Installed TRL {version} does not support optional {owner_name} "
+            f"argument(s), ignoring: {', '.join(unsupported)}",
+            flush=True,
+        )
+    return {name: value for name, value in kwargs.items() if name in supported}
+
+
+def build_grpo_config(args: argparse.Namespace, state: PartialState) -> GRPOConfig:
+    kwargs = {
+        "output_dir": args.output_dir,
+        "max_steps": args.max_steps,
+        "learning_rate": args.learning_rate,
+        "weight_decay": args.weight_decay,
+        "per_device_train_batch_size": args.per_device_train_batch_size,
+        "gradient_accumulation_steps": args.gradient_accumulation_steps,
+        "gradient_checkpointing": args.gradient_checkpointing,
+        "bf16": args.bf16,
+        "logging_steps": args.logging_steps,
+        "save_steps": args.save_steps,
+        "save_total_limit": args.save_total_limit,
+        "report_to": report_to_value(args.report_to),
+        "seed": args.seed,
+        "remove_unused_columns": False,
+        "max_prompt_length": args.max_prompt_length,
+        "max_completion_length": args.max_completion_length,
+        "num_generations": args.group_size,
+        "temperature": args.temperature,
+        "top_p": args.top_p,
+        "top_k": None if args.top_k <= 0 else args.top_k,
+        "beta": args.kl_beta,
+        "epsilon": args.clip_epsilon,
+        "num_iterations": args.num_iterations,
+        "scale_rewards": args.scale_rewards,
+        "loss_type": args.loss_type,
+        "sync_ref_model": True,
+        "ref_model_sync_steps": args.ref_update_steps,
+        "ref_model_mixup_alpha": args.ref_mixup_alpha,
+        "log_completions": True,
+    }
+    required = (
+        "max_completion_length",
+        "num_generations",
+        "temperature",
+        "beta",
+        "epsilon",
+        "sync_ref_model",
+        "ref_model_sync_steps",
+    )
+    return GRPOConfig(
+        **filter_supported_kwargs(GRPOConfig, kwargs, required, state, "GRPOConfig")
+    )
+
+
+def build_grpo_trainer(
+    model: Any,
+    reward_func: TacoUnitTestReward,
+    training_args: GRPOConfig,
+    train_dataset: Dataset,
+    tokenizer: Any,
+) -> GRPOTrainer:
+    kwargs: Dict[str, Any] = {
+        "model": model,
+        "reward_funcs": reward_func,
+        "args": training_args,
+        "train_dataset": train_dataset,
+    }
+    supported = supported_init_kwargs(GRPOTrainer.__init__)
+    if supported is None or "processing_class" in supported:
+        kwargs["processing_class"] = tokenizer
+    elif "tokenizer" in supported:
+        kwargs["tokenizer"] = tokenizer
+    return GRPOTrainer(**kwargs)
+
+
 def main() -> int:
+    set_process_cuda_device()
     args = parse_args()
     validate_batch_geometry(args)
     distributed_state = PartialState()
@@ -593,54 +711,27 @@ def main() -> int:
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "left"
 
-    model_kwargs = {
+    model_load_kwargs = {
         "trust_remote_code": args.trust_remote_code,
     }
     if args.bf16:
-        model_kwargs["torch_dtype"] = "bfloat16"
+        model_load_kwargs["torch_dtype"] = torch.bfloat16
 
-    training_args = GRPOConfig(
-        output_dir=args.output_dir,
-        max_steps=args.max_steps,
-        learning_rate=args.learning_rate,
-        weight_decay=args.weight_decay,
-        per_device_train_batch_size=args.per_device_train_batch_size,
-        gradient_accumulation_steps=args.gradient_accumulation_steps,
-        gradient_checkpointing=args.gradient_checkpointing,
-        bf16=args.bf16,
-        logging_steps=args.logging_steps,
-        save_steps=args.save_steps,
-        save_total_limit=args.save_total_limit,
-        report_to=report_to_value(args.report_to),
-        seed=args.seed,
-        remove_unused_columns=False,
-        model_init_kwargs=model_kwargs,
-        max_prompt_length=args.max_prompt_length,
-        max_completion_length=args.max_completion_length,
-        num_generations=args.group_size,
-        temperature=args.temperature,
-        top_p=args.top_p,
-        top_k=None if args.top_k <= 0 else args.top_k,
-        beta=args.kl_beta,
-        epsilon=args.clip_epsilon,
-        num_iterations=args.num_iterations,
-        scale_rewards=args.scale_rewards,
-        loss_type=args.loss_type,
-        sync_ref_model=True,
-        ref_model_sync_steps=args.ref_update_steps,
-        ref_model_mixup_alpha=args.ref_mixup_alpha,
-        log_completions=True,
+    model = AutoModelForCausalLM.from_pretrained(
+        args.model,
+        **model_load_kwargs,
     )
+    training_args = build_grpo_config(args, distributed_state)
 
-    trainer = GRPOTrainer(
-        model=args.model,
-        reward_funcs=TacoUnitTestReward(
+    trainer = build_grpo_trainer(
+        model=model,
+        reward_func=TacoUnitTestReward(
             timeout_seconds=args.reward_timeout_seconds,
             memory_limit_mb=args.memory_limit_mb,
         ),
-        args=training_args,
+        training_args=training_args,
         train_dataset=train_dataset,
-        processing_class=tokenizer,
+        tokenizer=tokenizer,
     )
     trainer.train()
     trainer.save_model(args.output_dir)
