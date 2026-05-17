@@ -518,6 +518,7 @@ class Transformer(nn.Module, PyTorchModelHubMixin): # extending PyTorchModelHubM
         return_hidden: bool = False,
         past_key_values: Optional[Tuple[Tuple[torch.Tensor, torch.Tensor], ...]] = None,
         use_cache: bool = False,
+        logits_to_keep: Optional[int] = None,
     ):
         _, seq_len = x.shape
         if past_key_values is None:
@@ -554,6 +555,16 @@ class Transformer(nn.Module, PyTorchModelHubMixin): # extending PyTorchModelHubM
         aux_output = total_aux_loss if self.use_moe and not self.use_lossfreebalance else None
         if return_hidden:
             return x, None, aux_output
+
+        if logits_to_keep is not None:
+            try:
+                keep = int(logits_to_keep)
+            except (TypeError, ValueError):
+                keep = 0
+            if keep > 0:
+                x = x[:, -keep:, :]
+                if targets is not None:
+                    targets = targets[:, -keep:]
 
         logits = self.ll_head(x)
         

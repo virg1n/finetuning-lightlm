@@ -159,6 +159,9 @@ class LightLMForCausalLM(PreTrainedModel, GenerationMixin):
         use_cache: Optional[bool] = None,
         **kwargs,
     ):
+        logits_to_keep = kwargs.pop("logits_to_keep", None)
+        if logits_to_keep is None:
+            logits_to_keep = kwargs.pop("num_logits_to_keep", None)
         del attention_mask, kwargs
         if use_cache is None:
             use_cache = bool(self.config.use_cache)
@@ -175,6 +178,7 @@ class LightLMForCausalLM(PreTrainedModel, GenerationMixin):
             targets=None,
             past_key_values=past_key_values,
             use_cache=use_cache,
+            logits_to_keep=logits_to_keep,
         )
         if use_cache:
             logits, _, _, present_key_values = outputs
@@ -184,6 +188,8 @@ class LightLMForCausalLM(PreTrainedModel, GenerationMixin):
 
         loss = None
         if labels is not None:
+            if logits.size(1) != labels.size(1):
+                labels = labels[:, -logits.size(1) :]
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
             loss = F.cross_entropy(
