@@ -600,6 +600,54 @@ def supported_init_kwargs(cls: Any) -> Optional[set]:
     return set(params)
 
 
+def trainer_supports_ref_model() -> bool:
+    supported = supported_init_kwargs(GRPOTrainer.__init__)
+    return supported is None or "ref_model" in supported
+
+
+def patch_trl_causal_lm_loader(default_kwargs: Dict[str, Any]) -> None:
+    """Make TRL's internal ref-model loader handle custom CausalLM code."""
+
+    def create_causal_lm_from_path(
+        model_id: str,
+        architecture: Any = None,
+        **kwargs: Any,
+    ) -> Any:
+        load_kwargs = dict(default_kwargs)
+        load_kwargs.update(kwargs)
+        dtype = load_kwargs.get("dtype")
+        if isinstance(dtype, str) and dtype in {"bfloat16", "float16", "float32"}:
+            load_kwargs["dtype"] = getattr(torch, dtype)
+        load_kwargs.setdefault("trust_remote_code", True)
+        model_cls = architecture or AutoModelForCausalLM
+        return model_cls.from_pretrained(model_id, **load_kwargs)
+
+    for module_name in ("trl.trainer.grpo_trainer", "trl.trainer.utils"):
+        module = sys.modules.get(module_name)
+        if module is not None and hasattr(module, "create_model_from_path"):
+            setattr(module, "create_model_from_path", create_causal_lm_from_path)
+
+
+def build_model_load_kwargs(args: argparse.Namespace) -> Dict[str, Any]:
+    kwargs: Dict[str, Any] = {
+        "trust_remote_code": args.trust_remote_code,
+    }
+    if args.bf16:
+        kwargs["dtype"] = torch.bfloat16
+    return kwargs
+
+
+def serializable_model_init_kwargs(kwargs: Dict[str, Any]) -> Dict[str, Any]:
+    init_kwargs = dict(kwargs)
+    if init_kwargs.get("dtype") is torch.bfloat16:
+        init_kwargs["dtype"] = "bfloat16"
+    elif init_kwargs.get("dtype") is torch.float16:
+        init_kwargs["dtype"] = "float16"
+    elif init_kwargs.get("dtype") is torch.float32:
+        init_kwargs["dtype"] = "float32"
+    return init_kwargs
+
+
 def filter_supported_kwargs(
     cls: Any,
     kwargs: Dict[str, Any],
@@ -629,7 +677,11 @@ def filter_supported_kwargs(
     return {name: value for name, value in kwargs.items() if name in supported}
 
 
-def build_grpo_config(args: argparse.Namespace, state: PartialState) -> GRPOConfig:
+def build_grpo_config(
+    args: argparse.Namespace,
+    state: PartialState,
+    model_init_kwargs: Dict[str, Any],
+) -> GRPOConfig:
     kwargs = {
         "output_dir": args.output_dir,
         "max_steps": args.max_steps,
@@ -638,6 +690,7 @@ def build_grpo_config(args: argparse.Namespace, state: PartialState) -> GRPOConf
         "per_device_train_batch_size": args.per_device_train_batch_size,
         "gradient_accumulation_steps": args.gradient_accumulation_steps,
         "gradient_checkpointing": args.gradient_checkpointing,
+        "model_init_kwargs": model_init_kwargs,
         "bf16": args.bf16,
         "logging_steps": args.logging_steps,
         "save_steps": args.save_steps,
@@ -677,7 +730,7 @@ def build_grpo_config(args: argparse.Namespace, state: PartialState) -> GRPOConf
 
 def build_grpo_trainer(
     model: Any,
-    ref_model: Any,
+    ref_model: Optional[Any],
     reward_func: TacoUnitTestReward,
     training_args: GRPOConfig,
     train_dataset: Dataset,
@@ -690,7 +743,7 @@ def build_grpo_trainer(
         "train_dataset": train_dataset,
     }
     supported = supported_init_kwargs(GRPOTrainer.__init__)
-    if supported is None or "ref_model" in supported:
+    if ref_model is not None and (supported is None or "ref_model" in supported):
         kwargs["ref_model"] = ref_model
     if supported is None or "processing_class" in supported:
         kwargs["processing_class"] = tokenizer
@@ -715,24 +768,27 @@ def main() -> int:
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "left"
 
-    model_load_kwargs = {
-        "trust_remote_code": args.trust_remote_code,
-    }
-    if args.bf16:
-        model_load_kwargs["dtype"] = torch.bfloat16
+    model_load_kwargs = build_model_load_kwargs(args)
+    patch_trl_causal_lm_loader(model_load_kwargs)
 
     model = AutoModelForCausalLM.from_pretrained(
         args.model,
         **model_load_kwargs,
     )
-    ref_model = AutoModelForCausalLM.from_pretrained(
-        args.model,
-        **model_load_kwargs,
+    ref_model: Optional[Any] = None
+    if trainer_supports_ref_model():
+        ref_model = AutoModelForCausalLM.from_pretrained(
+            args.model,
+            **model_load_kwargs,
+        )
+        ref_model.eval()
+        for param in ref_model.parameters():
+            param.requires_grad_(False)
+    training_args = build_grpo_config(
+        args,
+        distributed_state,
+        serializable_model_init_kwargs(model_load_kwargs),
     )
-    ref_model.eval()
-    for param in ref_model.parameters():
-        param.requires_grad_(False)
-    training_args = build_grpo_config(args, distributed_state)
 
     trainer = build_grpo_trainer(
         model=model,
