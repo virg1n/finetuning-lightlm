@@ -541,6 +541,7 @@ def align_reward_column(values: Any, target_len: int, default: Any) -> List[Any]
 
 class TacoUnitTestReward:
     def __init__(self, timeout_seconds: float, memory_limit_mb: int):
+        self.__name__ = "taco_unit_test_reward"
         self.timeout_seconds = timeout_seconds
         self.memory_limit_mb = memory_limit_mb
 
@@ -715,7 +716,7 @@ def main() -> int:
         "trust_remote_code": args.trust_remote_code,
     }
     if args.bf16:
-        model_load_kwargs["torch_dtype"] = torch.bfloat16
+        model_load_kwargs["dtype"] = torch.bfloat16
 
     model = AutoModelForCausalLM.from_pretrained(
         args.model,
