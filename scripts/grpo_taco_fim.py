@@ -277,6 +277,15 @@ def parse_args() -> argparse.Namespace:
             "gradient_accumulation_steps, which can OOM during generation for long code prompts."
         ),
     )
+    parser.add_argument(
+        "--logprob-batch-size",
+        type=int,
+        default=2,
+        help=(
+            "Maximum per-rank sub-batch used for GRPO logprob/entropy forwards. "
+            "Lower this if loss computation still OOMs; it does not change group size."
+        ),
+    )
     parser.add_argument("--gradient-checkpointing", action="store_true")
     parser.add_argument("--bf16", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--seed", type=int, default=1338)
@@ -821,6 +830,63 @@ def patch_lightlm_transformers_compat(model: Any) -> None:
         patch_lightlm_logits_to_keep_forward(model)
 
 
+class LightLMGRPOTrainer(GRPOTrainer):
+    def _resolve_logprob_batch_size(
+        self,
+        input_ids: torch.Tensor,
+        requested_batch_size: Optional[int],
+    ) -> int:
+        candidates = [int(input_ids.size(0))]
+        if requested_batch_size is not None and requested_batch_size > 0:
+            candidates.append(int(requested_batch_size))
+        configured = int(getattr(self.args, "lightlm_logprob_batch_size", 0) or 0)
+        if configured > 0:
+            candidates.append(configured)
+        return max(1, min(candidates))
+
+    def _get_per_token_logps(
+        self,
+        model: Any,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        logits_to_keep: int,
+        batch_size: Optional[int] = None,
+        *args: Any,
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        batch_size = self._resolve_logprob_batch_size(input_ids, batch_size)
+        return super()._get_per_token_logps(
+            model,
+            input_ids,
+            attention_mask,
+            logits_to_keep,
+            batch_size,
+            *args,
+            **kwargs,
+        )
+
+    def _get_per_token_logps_and_entropies(
+        self,
+        model: Any,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        logits_to_keep: int,
+        batch_size: Optional[int] = None,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        batch_size = self._resolve_logprob_batch_size(input_ids, batch_size)
+        return super()._get_per_token_logps_and_entropies(
+            model,
+            input_ids,
+            attention_mask,
+            logits_to_keep,
+            batch_size,
+            *args,
+            **kwargs,
+        )
+
+
 def build_model_load_kwargs(args: argparse.Namespace) -> Dict[str, Any]:
     kwargs: Dict[str, Any] = {
         "trust_remote_code": args.trust_remote_code,
@@ -930,7 +996,7 @@ def build_grpo_trainer(
         kwargs["processing_class"] = tokenizer
     elif "tokenizer" in supported:
         kwargs["tokenizer"] = tokenizer
-    return GRPOTrainer(**kwargs)
+    return LightLMGRPOTrainer(**kwargs)
 
 
 def main() -> int:
@@ -968,6 +1034,7 @@ def main() -> int:
         for param in ref_model.parameters():
             param.requires_grad_(False)
     training_args = build_grpo_config(args, distributed_state)
+    setattr(training_args, "lightlm_logprob_batch_size", args.logprob_batch_size)
 
     trainer = build_grpo_trainer(
         model=model,
