@@ -107,7 +107,7 @@ class LightLMConfig(PretrainedConfig):
 class LightLMForCausalLM(PreTrainedModel, GenerationMixin):
     config_class = LightLMConfig
     base_model_prefix = "lightlm"
-    supports_gradient_checkpointing = False
+    supports_gradient_checkpointing = True
     _tied_weights_keys = ["lightlm.tokens_embedding.weight", "lightlm.ll_head.weight"]
 
     def __init__(self, config: LightLMConfig):
@@ -137,6 +137,20 @@ class LightLMForCausalLM(PreTrainedModel, GenerationMixin):
         self.lightlm.tokens_embedding.weight = self.lightlm.ll_head.weight
         self.all_tied_weights_keys = {key: key for key in self._tied_weights_keys}
 
+    def _set_gradient_checkpointing(
+        self,
+        module=None,
+        value: bool = False,
+        enable: Optional[bool] = None,
+        gradient_checkpointing_func=None,
+    ):
+        enabled = bool(value if enable is None else enable)
+        target = self.lightlm if module is None or module is self else module
+        if hasattr(target, "gradient_checkpointing"):
+            target.gradient_checkpointing = enabled
+            if gradient_checkpointing_func is not None:
+                target._gradient_checkpointing_func = gradient_checkpointing_func
+
     def prepare_inputs_for_generation(self, input_ids, past_key_values=None, attention_mask=None, **kwargs):
         past_length = _past_key_values_length(past_key_values)
         if past_length > 0:
@@ -164,9 +178,11 @@ class LightLMForCausalLM(PreTrainedModel, GenerationMixin):
         if logits_to_keep is None:
             logits_to_keep = num_logits_to_keep
         del attention_mask, kwargs
+        train_grad_enabled = self.training and torch.is_grad_enabled()
         if use_cache is None:
-            use_cache = bool(self.config.use_cache)
-        if labels is not None:
+            use_cache = bool(self.config.use_cache) and not train_grad_enabled
+        checkpointing_enabled = bool(getattr(self.lightlm, "gradient_checkpointing", False))
+        if labels is not None or (train_grad_enabled and checkpointing_enabled):
             use_cache = False
 
         if _past_key_values_length(past_key_values) == 0:

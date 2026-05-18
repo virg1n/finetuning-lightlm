@@ -9,6 +9,7 @@ import math
 import tiktoken
 import inspect
 import os
+from functools import partial
 from contextlib import nullcontext
 from dataclasses import dataclass
 from huggingface_hub import PyTorchModelHubMixin
@@ -17,6 +18,7 @@ from typing import List, Optional, Tuple
 from torch.distributed import init_process_group, destroy_process_group
 from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
+from torch.utils.checkpoint import checkpoint as checkpoint_fn
 
 try:
     from torch.nn.attention import SDPBackend, sdpa_kernel
@@ -495,6 +497,8 @@ class Transformer(nn.Module, PyTorchModelHubMixin): # extending PyTorchModelHubM
         self.blocks = nn.ModuleList()
         for _ in range(self.num_layers):
             self.blocks.append(Block(config))
+        self.gradient_checkpointing = False
+        self._gradient_checkpointing_func = partial(checkpoint_fn, use_reentrant=False)
 
         self.norm = torch.nn.modules.normalization.RMSNorm(config.num_dims, config.rmsnorm_eps) # you also can use RMSNorm(config)
         self.ll_head = nn.Linear(self.num_dims, self.vocab_size, bias=False)
@@ -536,16 +540,44 @@ class Transformer(nn.Module, PyTorchModelHubMixin): # extending PyTorchModelHubM
         total_aux_loss = 0
         present_key_values: List[Tuple[torch.Tensor, torch.Tensor]] = []
 
+        use_gradient_checkpointing = (
+            self.gradient_checkpointing
+            and self.training
+            and torch.is_grad_enabled()
+            and not use_cache
+            and not (self.use_moe and self.use_lossfreebalance)
+        )
+
         for block, past_key_value in zip(self.blocks, past_key_values):
-            x, aux_loss, present_key_value = block(
-                x,
-                cos,
-                sin,
-                start_pos=start_pos,
-                positions=positions,
-                past_key_value=past_key_value,
-                use_cache=use_cache,
-            )
+            if use_gradient_checkpointing and past_key_value is None:
+                def checkpointed_block(hidden, current_block=block):
+                    block_out, block_aux_loss, _ = current_block(
+                        hidden,
+                        cos,
+                        sin,
+                        start_pos=start_pos,
+                        positions=positions,
+                        past_key_value=None,
+                        use_cache=False,
+                    )
+                    if block_aux_loss is None:
+                        block_aux_loss = hidden.new_zeros(())
+                    return block_out, block_aux_loss
+
+                x, aux_loss = self._gradient_checkpointing_func(checkpointed_block, x)
+                if not self.use_moe:
+                    aux_loss = None
+                present_key_value = None
+            else:
+                x, aux_loss, present_key_value = block(
+                    x,
+                    cos,
+                    sin,
+                    start_pos=start_pos,
+                    positions=positions,
+                    past_key_value=past_key_value,
+                    use_cache=use_cache,
+                )
             if use_cache:
                 present_key_values.append(present_key_value)
             if self.use_moe and not self.use_lossfreebalance:

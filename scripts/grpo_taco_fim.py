@@ -7,6 +7,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+from functools import partial
 from types import MethodType
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -23,6 +24,7 @@ import torch
 import trl
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers.modeling_outputs import CausalLMOutputWithPast
+from torch.utils.checkpoint import checkpoint as checkpoint_fn
 from trl import GRPOConfig, GRPOTrainer
 
 
@@ -688,12 +690,204 @@ def causal_lm_output_with_optional_loss(
     return CausalLMOutputWithPast(loss=loss, logits=logits, past_key_values=present_key_values)
 
 
+def should_disable_train_cache(model: Any, labels: Any) -> bool:
+    if labels is not None:
+        return True
+    if not (getattr(model, "training", False) and torch.is_grad_enabled()):
+        return False
+    lightlm = getattr(model, "lightlm", None)
+    return bool(getattr(lightlm, "gradient_checkpointing", False))
+
+
+def default_use_cache_for_call(model: Any, use_cache: Optional[bool], labels: Any) -> bool:
+    if should_disable_train_cache(model, labels):
+        return False
+    if use_cache is not None:
+        return bool(use_cache)
+    return bool(getattr(getattr(model, "config", None), "use_cache", False)) and not (
+        getattr(model, "training", False) and torch.is_grad_enabled()
+    )
+
+
+def patch_lightlm_gradient_checkpointing(model: Any) -> None:
+    lightlm = getattr(model, "lightlm", None)
+    if lightlm is None or getattr(lightlm, "_lightlm_gradient_checkpointing_patched", False):
+        return
+    required_attrs = ("blocks", "tokens_embedding", "rotary_emb", "norm", "ll_head")
+    if not all(hasattr(lightlm, name) for name in required_attrs):
+        return
+
+    lightlm.gradient_checkpointing = bool(getattr(lightlm, "gradient_checkpointing", False))
+    if not hasattr(lightlm, "_gradient_checkpointing_func"):
+        lightlm._gradient_checkpointing_func = partial(checkpoint_fn, use_reentrant=False)
+
+    def lightlm_forward_with_checkpointing(
+        self: Any,
+        x: torch.Tensor,
+        targets: Optional[torch.Tensor] = None,
+        start_pos: int = 0,
+        positions: Optional[torch.Tensor] = None,
+        return_hidden: bool = False,
+        past_key_values: Any = None,
+        use_cache: bool = False,
+        logits_to_keep: Optional[int] = None,
+    ) -> Any:
+        if past_key_values is None:
+            past_key_values = tuple([None] * len(self.blocks))
+        if past_key_values and past_key_values[0] is not None:
+            start_pos = past_key_values[0][0].size(2)
+
+        hidden_states = self.tokens_embedding(x)
+        cos, sin = self.rotary_emb(
+            hidden_states,
+            seq_dim=1,
+            positions=positions,
+            start_pos=start_pos,
+        )
+
+        total_aux_loss = hidden_states.new_zeros(())
+        present_key_values: List[Any] = []
+        use_gradient_checkpointing = (
+            bool(getattr(self, "gradient_checkpointing", False))
+            and self.training
+            and torch.is_grad_enabled()
+            and not use_cache
+            and not (getattr(self, "use_moe", False) and getattr(self, "use_lossfreebalance", False))
+        )
+
+        for block, past_key_value in zip(self.blocks, past_key_values):
+            if use_gradient_checkpointing and past_key_value is None:
+                def checkpointed_block(hidden: torch.Tensor, current_block: Any = block) -> Tuple[torch.Tensor, torch.Tensor]:
+                    block_out, block_aux_loss, _ = current_block(
+                        hidden,
+                        cos,
+                        sin,
+                        start_pos=start_pos,
+                        positions=positions,
+                        past_key_value=None,
+                        use_cache=False,
+                    )
+                    if block_aux_loss is None:
+                        block_aux_loss = hidden.new_zeros(())
+                    return block_out, block_aux_loss
+
+                hidden_states, aux_loss = self._gradient_checkpointing_func(
+                    checkpointed_block,
+                    hidden_states,
+                )
+                if not getattr(self, "use_moe", False):
+                    aux_loss = None
+                present_key_value = None
+            else:
+                hidden_states, aux_loss, present_key_value = block(
+                    hidden_states,
+                    cos,
+                    sin,
+                    start_pos=start_pos,
+                    positions=positions,
+                    past_key_value=past_key_value,
+                    use_cache=use_cache,
+                )
+            if use_cache:
+                present_key_values.append(present_key_value)
+            if getattr(self, "use_moe", False) and not getattr(self, "use_lossfreebalance", False):
+                total_aux_loss = total_aux_loss + aux_loss
+
+        hidden_states = self.norm(hidden_states)
+        aux_output = (
+            total_aux_loss
+            if getattr(self, "use_moe", False) and not getattr(self, "use_lossfreebalance", False)
+            else None
+        )
+        if return_hidden:
+            return hidden_states, None, aux_output
+
+        if logits_to_keep is not None:
+            keep = positive_int_or_zero(logits_to_keep)
+            if keep > 0:
+                hidden_states = hidden_states[:, -keep:, :]
+                if targets is not None:
+                    targets = targets[:, -keep:]
+
+        logits = self.ll_head(hidden_states)
+
+        if targets is None:
+            loss = None
+            ce_loss = aux_output
+        else:
+            batch_size, context_len, vocab_size = logits.shape
+            ce_loss = torch.nn.functional.cross_entropy(
+                logits.view(batch_size * context_len, vocab_size),
+                targets.view(batch_size * context_len),
+            )
+            if getattr(self, "use_moe", False) and not getattr(self, "use_lossfreebalance", False):
+                loss = ce_loss + total_aux_loss
+            else:
+                loss = ce_loss
+                ce_loss = aux_loss
+
+        if use_cache:
+            return logits, loss, ce_loss, tuple(present_key_values)
+        return logits, loss, ce_loss
+
+    def set_gradient_checkpointing(
+        self: Any,
+        module: Any = None,
+        value: bool = False,
+        enable: Optional[bool] = None,
+        gradient_checkpointing_func: Any = None,
+    ) -> None:
+        enabled = bool(value if enable is None else enable)
+        target = getattr(self, "lightlm", None) if module is None or module is self else module
+        if hasattr(target, "gradient_checkpointing"):
+            target.gradient_checkpointing = enabled
+            if gradient_checkpointing_func is not None:
+                target._gradient_checkpointing_func = gradient_checkpointing_func
+
+    lightlm.forward = MethodType(lightlm_forward_with_checkpointing, lightlm)
+    lightlm._lightlm_gradient_checkpointing_patched = True
+    model.supports_gradient_checkpointing = True
+    type(model).supports_gradient_checkpointing = True
+    model._set_gradient_checkpointing = MethodType(set_gradient_checkpointing, model)
+
+
 def patch_lightlm_logits_to_keep_forward(model: Any) -> None:
     """Expose and implement logits_to_keep for older exported LightLM HF wrappers."""
 
     if getattr(model, "_lightlm_logits_to_keep_patched", False):
         return
     if supports_parameter(model.forward, "logits_to_keep"):
+        original_forward = model.forward
+        supports_num_logits_to_keep = supports_parameter(original_forward, "num_logits_to_keep")
+
+        def forward_with_training_cache_default(
+            self: Any,
+            input_ids: Optional[torch.LongTensor] = None,
+            attention_mask: Optional[torch.Tensor] = None,
+            labels: Optional[torch.LongTensor] = None,
+            past_key_values: Any = None,
+            use_cache: Optional[bool] = None,
+            logits_to_keep: Optional[int] = None,
+            num_logits_to_keep: Optional[int] = None,
+            **kwargs: Any,
+        ) -> CausalLMOutputWithPast:
+            call_kwargs = dict(kwargs)
+            call_kwargs.update(
+                {
+                    "input_ids": input_ids,
+                    "attention_mask": attention_mask,
+                    "labels": labels,
+                    "past_key_values": past_key_values,
+                    "use_cache": default_use_cache_for_call(self, use_cache, labels),
+                    "logits_to_keep": logits_to_keep,
+                }
+            )
+            if supports_num_logits_to_keep:
+                call_kwargs["num_logits_to_keep"] = num_logits_to_keep
+            return original_forward(**call_kwargs)
+
+        model.forward = MethodType(forward_with_training_cache_default, model)
+        model._lightlm_logits_to_keep_patched = True
         return
 
     lightlm = getattr(model, "lightlm", None)
@@ -726,15 +920,12 @@ def patch_lightlm_logits_to_keep_forward(model: Any) -> None:
                 attention_mask=attention_mask,
                 labels=labels,
                 past_key_values=past_key_values,
-                use_cache=use_cache,
+                use_cache=default_use_cache_for_call(self, use_cache, labels),
                 **kwargs,
             )
 
         del attention_mask, kwargs
-        if use_cache is None:
-            use_cache = bool(getattr(self.config, "use_cache", False))
-        if labels is not None:
-            use_cache = False
+        use_cache = default_use_cache_for_call(self, use_cache, labels)
 
         if past_key_values_length(past_key_values) == 0:
             past_key_values = None
@@ -827,6 +1018,7 @@ def patch_lightlm_transformers_compat(model: Any) -> None:
         generation_config = getattr(model, "generation_config", None)
         if generation_config is not None:
             generation_config.cache_implementation = None
+        patch_lightlm_gradient_checkpointing(model)
         patch_lightlm_logits_to_keep_forward(model)
 
 
