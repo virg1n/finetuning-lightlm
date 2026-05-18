@@ -157,16 +157,15 @@ class LightLMForCausalLM(PreTrainedModel, GenerationMixin):
         labels: Optional[torch.LongTensor] = None,
         past_key_values=None,
         use_cache: Optional[bool] = None,
+        logits_to_keep: Optional[int] = None,
+        num_logits_to_keep: Optional[int] = None,
         **kwargs,
     ):
-        logits_to_keep = kwargs.pop("logits_to_keep", None)
         if logits_to_keep is None:
-            logits_to_keep = kwargs.pop("num_logits_to_keep", None)
+            logits_to_keep = num_logits_to_keep
         del attention_mask, kwargs
         if use_cache is None:
             use_cache = bool(self.config.use_cache)
-        elif labels is None and bool(self.config.use_cache):
-            use_cache = True
         if labels is not None:
             use_cache = False
 

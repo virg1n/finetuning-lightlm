@@ -7,6 +7,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+from types import MethodType
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -21,6 +22,7 @@ from huggingface_hub import hf_hub_download, list_repo_files
 import torch
 import trl
 from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers.modeling_outputs import CausalLMOutputWithPast
 from trl import GRPOConfig, GRPOTrainer
 
 
@@ -607,6 +609,30 @@ def set_process_cuda_device() -> None:
         pass
 
 
+def past_key_values_length(past_key_values: Any) -> int:
+    if past_key_values is None:
+        return 0
+    if hasattr(past_key_values, "get_seq_length"):
+        try:
+            return int(past_key_values.get_seq_length())
+        except TypeError:
+            return int(past_key_values.get_seq_length(0))
+        except Exception:
+            pass
+    try:
+        if len(past_key_values) == 0:
+            return 0
+    except TypeError:
+        return 0
+    first_layer = past_key_values[0] if len(past_key_values) else None
+    if first_layer is None:
+        return 0
+    try:
+        return int(first_layer[0].size(2))
+    except Exception:
+        return 0
+
+
 def supported_init_kwargs(cls: Any) -> Optional[set]:
     signature = inspect.signature(cls)
     params = signature.parameters
@@ -618,6 +644,131 @@ def supported_init_kwargs(cls: Any) -> Optional[set]:
 def trainer_supports_ref_model() -> bool:
     supported = supported_init_kwargs(GRPOTrainer.__init__)
     return supported is None or "ref_model" in supported
+
+
+def supports_parameter(callable_obj: Any, name: str) -> bool:
+    try:
+        return name in inspect.signature(callable_obj).parameters
+    except (TypeError, ValueError):
+        return False
+
+
+def positive_int_or_zero(value: Any) -> int:
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return 0
+
+
+def causal_lm_output_with_optional_loss(
+    logits: torch.Tensor,
+    labels: Optional[torch.LongTensor],
+    present_key_values: Any,
+) -> CausalLMOutputWithPast:
+    loss = None
+    if labels is not None:
+        if logits.size(1) != labels.size(1):
+            labels = labels[:, -logits.size(1) :]
+        shift_logits = logits[..., :-1, :].contiguous()
+        shift_labels = labels[..., 1:].contiguous()
+        loss = torch.nn.functional.cross_entropy(
+            shift_logits.view(-1, shift_logits.size(-1)),
+            shift_labels.view(-1),
+            ignore_index=-100,
+        )
+    return CausalLMOutputWithPast(loss=loss, logits=logits, past_key_values=present_key_values)
+
+
+def patch_lightlm_logits_to_keep_forward(model: Any) -> None:
+    """Expose and implement logits_to_keep for older exported LightLM HF wrappers."""
+
+    if getattr(model, "_lightlm_logits_to_keep_patched", False):
+        return
+    if supports_parameter(model.forward, "logits_to_keep"):
+        return
+
+    lightlm = getattr(model, "lightlm", None)
+    if lightlm is None:
+        return
+
+    transformer_supports_logits_to_keep = supports_parameter(lightlm.forward, "logits_to_keep")
+    transformer_supports_return_hidden = supports_parameter(lightlm.forward, "return_hidden")
+    if not transformer_supports_logits_to_keep and not transformer_supports_return_hidden:
+        return
+
+    original_forward = model.forward
+
+    def forward_with_logits_to_keep(
+        self: Any,
+        input_ids: Optional[torch.LongTensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        labels: Optional[torch.LongTensor] = None,
+        past_key_values: Any = None,
+        use_cache: Optional[bool] = None,
+        logits_to_keep: Optional[int] = None,
+        num_logits_to_keep: Optional[int] = None,
+        **kwargs: Any,
+    ) -> CausalLMOutputWithPast:
+        if logits_to_keep is None:
+            logits_to_keep = num_logits_to_keep
+        if logits_to_keep is None:
+            return original_forward(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                labels=labels,
+                past_key_values=past_key_values,
+                use_cache=use_cache,
+                **kwargs,
+            )
+
+        del attention_mask, kwargs
+        if use_cache is None:
+            use_cache = bool(getattr(self.config, "use_cache", False))
+        if labels is not None:
+            use_cache = False
+
+        if past_key_values_length(past_key_values) == 0:
+            past_key_values = None
+
+        if transformer_supports_logits_to_keep:
+            outputs = self.lightlm(
+                input_ids,
+                targets=None,
+                past_key_values=past_key_values,
+                use_cache=use_cache,
+                logits_to_keep=logits_to_keep,
+            )
+            if use_cache:
+                logits, _, _, present_key_values = outputs
+            else:
+                logits, _, _ = outputs
+                present_key_values = None
+            return causal_lm_output_with_optional_loss(logits, labels, present_key_values)
+
+        if use_cache:
+            return original_forward(
+                input_ids=input_ids,
+                labels=labels,
+                past_key_values=past_key_values,
+                use_cache=use_cache,
+            )
+
+        hidden, _, _ = self.lightlm(
+            input_ids,
+            targets=None,
+            past_key_values=past_key_values,
+            use_cache=False,
+            return_hidden=True,
+        )
+        keep = positive_int_or_zero(logits_to_keep)
+        if keep > 0:
+            hidden = hidden[:, -keep:, :]
+        output_embeddings = self.get_output_embeddings()
+        logits = output_embeddings(hidden)
+        return causal_lm_output_with_optional_loss(logits, labels, None)
+
+    model.forward = MethodType(forward_with_logits_to_keep, model)
+    model._lightlm_logits_to_keep_patched = True
 
 
 def patch_trl_causal_lm_loader(default_kwargs: Dict[str, Any]) -> None:
@@ -667,6 +818,7 @@ def patch_lightlm_transformers_compat(model: Any) -> None:
         generation_config = getattr(model, "generation_config", None)
         if generation_config is not None:
             generation_config.cache_implementation = None
+        patch_lightlm_logits_to_keep_forward(model)
 
 
 def build_model_load_kwargs(args: argparse.Namespace) -> Dict[str, Any]:
