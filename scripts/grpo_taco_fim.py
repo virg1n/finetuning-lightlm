@@ -293,7 +293,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=1338)
     parser.add_argument("--logging-steps", type=int, default=10)
     parser.add_argument("--save-steps", type=int, default=100)
-    parser.add_argument("--save-total-limit", type=int, default=3)
+    parser.add_argument("--save-total-limit", "--max-saves", dest="save_total_limit", type=int, default=1)
     parser.add_argument("--report-to", default="none")
 
     parser.add_argument("--clip-epsilon", type=float, default=0.2)
@@ -1132,6 +1132,7 @@ def build_grpo_config(
         "gradient_checkpointing": args.gradient_checkpointing,
         "bf16": args.bf16,
         "logging_steps": args.logging_steps,
+        "save_strategy": "steps",
         "save_steps": args.save_steps,
         "save_total_limit": args.save_total_limit,
         "report_to": report_to_value(args.report_to),
