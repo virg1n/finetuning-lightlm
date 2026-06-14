@@ -97,7 +97,7 @@
     "weight_decay": 0.1,
     "betas": [0.9, 0.95],
     "grad_clip": 1.0,
-    "checkpoint_interval_steps": 1000,
+    "checkpoint_interval_steps": 500,
     "max_checkpoints_to_keep": 5,
     "log_interval_steps": 10,
     "parallel_shard_building": true,
@@ -115,7 +115,7 @@
     "bigcode_harness": {
       "enabled": true,
       "initial_eval_enabled": false,
-      "interval_steps": 1000,
+      "interval_steps": 500,
       "interval_tokens": 0,
       "score_task": "humaneval",
       "score_metric": "pass@1",

@@ -2564,8 +2564,11 @@ def run_bigcode_eval(
         return {"ok": True, "skipped": True, "score": None, "reason": "disabled"}
     interval_steps = int(eval_cfg.get("interval_steps", 0))
     next_eval_step = int(manifest.get("next_eval_step") or interval_steps or 0)
-    if not force and interval_steps > 0 and global_step < next_eval_step:
-        return {"ok": True, "skipped": True, "score": None, "reason": "step_interval"}
+    if not force and interval_steps > 0:
+        due_by_schedule = global_step > 0 and global_step % interval_steps == 0
+        due_by_manifest = global_step >= next_eval_step
+        if not due_by_schedule and not due_by_manifest:
+            return {"ok": True, "skipped": True, "score": None, "reason": "step_interval"}
     next_eval = int(manifest.get("next_eval_tokens") or eval_cfg.get("interval_tokens", 0))
     if not force and interval_steps <= 0 and next_eval > 0 and tokens_trained < next_eval:
         return {"ok": True, "skipped": True, "score": None, "reason": "token_interval"}
@@ -2642,6 +2645,11 @@ def run_bigcode_eval(
             metric_path.unlink()
         except OSError:
             pass
+    print(
+        f"Starting BigCode eval at step {global_step} "
+        f"tokens={tokens_trained:,} -> {metric_output_path}",
+        flush=True,
+    )
     env = clean_subprocess_distributed_env(os.environ)
     returncode = run_subprocess_with_bounded_output(
         command,
@@ -2657,6 +2665,12 @@ def run_bigcode_eval(
     tie_break_task = str(eval_cfg.get("tie_break_task", "mbpp")).lower()
     eval_score = eval_scores.get(primary_task)
     tie_break_score = eval_scores.get(tie_break_task)
+    print(
+        f"Finished BigCode eval at step {global_step} "
+        f"returncode={returncode} scores={eval_scores} "
+        f"results={metric_output_path}",
+        flush=True,
+    )
     append_jsonl(
         log_path,
         {
