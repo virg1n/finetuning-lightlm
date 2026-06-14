@@ -139,7 +139,7 @@
         "--precision",
         "bf16",
         "--tasks",
-        "humaneval,mbpp",
+        "humaneval",
         "--max_length_generation",
         "2048",
         "--temperature",

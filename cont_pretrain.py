@@ -2294,6 +2294,7 @@ def export_eval_model(
         torch.save(state, export_dir / "pytorch_model.bin")
 
     model_cfg = config["model"]
+    eval_use_cache = bool(model_cfg.get("use_cache", False))
     hf_config = {
         "model_type": "lightlm",
         "architectures": ["LightLMForCausalLM"],
@@ -2319,7 +2320,7 @@ def export_eval_model(
         "rmsnorm_eps": model_cfg["rmsnorm_eps"],
         "rope_theta": model_cfg["rope_theta"],
         "context_len": model_cfg["context_len"],
-        "use_cache": True,
+        "use_cache": eval_use_cache,
         "use_flash": model_cfg["use_flash"],
         "use_moe": model_cfg["use_moe"],
         "moe_num_experts": model_cfg["moe_num_experts"],
@@ -2336,7 +2337,7 @@ def export_eval_model(
             "bos_token_id": tokenizer.bos_token_id,
             "eos_token_id": tokenizer.eos_token_id,
             "pad_token_id": tokenizer.pad_token_id,
-            "use_cache": True,
+            "use_cache": eval_use_cache,
         },
     )
     shutil.copy2(Path(__file__).with_name("hf_lightlm.py"), export_dir / "hf_lightlm.py")

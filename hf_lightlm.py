@@ -122,7 +122,11 @@ class LightLMForCausalLM(PreTrainedModel, GenerationMixin):
         self.lightlm = Transformer(config.to_model_config())
         self.all_tied_weights_keys = {key: key for key in self._tied_weights_keys}
         self.tie_weights()
-        self.generation_config.use_cache = True
+        # LightLM returns legacy tuple KV caches. Keep Transformers from trying
+        # cache-class plumbing, and let the exported config decide cache usage.
+        self._supports_cache_class = False
+        self.generation_config.use_cache = bool(config.use_cache)
+        self.generation_config.cache_implementation = None
 
     def tie_weights(self, *args, **kwargs):
         del args, kwargs
@@ -158,9 +162,23 @@ class LightLMForCausalLM(PreTrainedModel, GenerationMixin):
             if gradient_checkpointing_func is not None:
                 target._gradient_checkpointing_func = gradient_checkpointing_func
 
-    def prepare_inputs_for_generation(self, input_ids, past_key_values=None, attention_mask=None, **kwargs):
+    def prepare_inputs_for_generation(
+        self,
+        input_ids,
+        past_key_values=None,
+        attention_mask=None,
+        use_cache=None,
+        **kwargs,
+    ):
+        del kwargs
+        if use_cache is None:
+            use_cache = getattr(self.generation_config, "use_cache", self.config.use_cache)
+        use_cache = bool(use_cache)
+        if not use_cache:
+            past_key_values = None
+
         past_length = _past_key_values_length(past_key_values)
-        if past_length > 0:
+        if use_cache and past_length > 0:
             input_ids = input_ids[:, past_length:]
             if input_ids.size(1) == 0:
                 input_ids = input_ids[:, -1:]
@@ -168,7 +186,7 @@ class LightLMForCausalLM(PreTrainedModel, GenerationMixin):
             "input_ids": input_ids,
             "past_key_values": past_key_values,
             "attention_mask": attention_mask,
-            "use_cache": True,
+            "use_cache": use_cache,
         }
 
     def forward(
