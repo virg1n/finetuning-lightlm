@@ -141,7 +141,7 @@
         "--tasks",
         "humaneval,mbpp",
         "--max_length_generation",
-        "1024",
+        "2048",
         "--temperature",
         "0.2",
         "--n_samples",

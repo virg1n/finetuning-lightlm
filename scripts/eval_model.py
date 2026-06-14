@@ -134,6 +134,19 @@ def print_results(path: Path) -> None:
             print(f"    keys: {', '.join(sorted(task_result.keys()))}")
 
 
+def tail_text(path: Path, max_bytes: int = 8192) -> str:
+    if not path.exists() or max_bytes <= 0:
+        return ""
+    try:
+        with path.open("rb") as f:
+            if path.stat().st_size > max_bytes:
+                f.seek(-max_bytes, 2)
+            data = f.read()
+    except OSError:
+        return ""
+    return data.decode("utf-8", errors="replace").strip()
+
+
 def expected_generation_paths(save_generations_path: str, tasks: str) -> List[Path]:
     base = resolve_path(save_generations_path, Path.cwd())
     stem = base.with_suffix("")
@@ -368,8 +381,8 @@ def main() -> int:
     parser.add_argument("--precision", default=None)
     parser.add_argument(
         "--max-length-generation",
-        default="1024",
-        help="Total prompt+completion length for the harness. 1024 avoids zero-room MBPP prompts.",
+        default="2048",
+        help="Total prompt+completion length for the harness. Use 2048 for MBPP to leave completion room.",
     )
     parser.add_argument("--temperature", default=None)
     parser.add_argument("--top-k", default=None)
@@ -462,6 +475,10 @@ def main() -> int:
         print_results(metric_output_path)
     if result.returncode != 0:
         print(f"eval failed; inspect log: {stdout_log_file}")
+        stdout_tail = tail_text(stdout_log_file)
+        if stdout_tail:
+            print("stdout_tail:")
+            print(stdout_tail)
     return int(result.returncode)
 
 
