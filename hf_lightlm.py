@@ -67,6 +67,12 @@ class LightLMConfig(PretrainedConfig):
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
         self.num_layers = num_layers
+        self.hidden_size = num_dims
+        self.num_hidden_layers = num_layers
+        self.num_attention_heads = num_heads
+        self.num_key_value_heads = num_kv_heads
+        self.intermediate_size = ffn_hidden_dims
+        self.max_position_embeddings = context_len
         self.ffn_hidden_dims = ffn_hidden_dims
         self.rmsnorm_eps = rmsnorm_eps
         self.rope_theta = rope_theta
@@ -108,6 +114,7 @@ class LightLMForCausalLM(PreTrainedModel, GenerationMixin):
     config_class = LightLMConfig
     base_model_prefix = "lightlm"
     supports_gradient_checkpointing = True
+    _is_stateful = True
     _tied_weights_keys = ["lightlm.tokens_embedding.weight", "lightlm.ll_head.weight"]
 
     def __init__(self, config: LightLMConfig):

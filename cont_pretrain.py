@@ -2309,6 +2309,12 @@ def export_eval_model(
         "num_heads": model_cfg["num_heads"],
         "num_kv_heads": model_cfg["num_kv_heads"],
         "num_layers": model_cfg["num_layers"],
+        "hidden_size": model_cfg["num_dims"],
+        "num_hidden_layers": model_cfg["num_layers"],
+        "num_attention_heads": model_cfg["num_heads"],
+        "num_key_value_heads": model_cfg["num_kv_heads"],
+        "intermediate_size": model_cfg["ffn_hidden_dims"],
+        "max_position_embeddings": model_cfg["context_len"],
         "ffn_hidden_dims": model_cfg["ffn_hidden_dims"],
         "rmsnorm_eps": model_cfg["rmsnorm_eps"],
         "rope_theta": model_cfg["rope_theta"],
@@ -2418,6 +2424,19 @@ def run_subprocess_with_bounded_output(
         with stdout_path.open("wb") as f:
             f.write(tail)
     return returncode
+
+
+def read_text_tail(path: Path, max_bytes: int) -> str:
+    if max_bytes <= 0 or not path.exists():
+        return ""
+    try:
+        with path.open("rb") as f:
+            if path.stat().st_size > max_bytes:
+                f.seek(-max_bytes, os.SEEK_END)
+            data = f.read()
+    except OSError:
+        return ""
+    return data.decode("utf-8", errors="replace").strip()
 
 
 def compact_eval_results(path: Path) -> Optional[Any]:
@@ -2671,6 +2690,14 @@ def run_bigcode_eval(
         f"results={metric_output_path}",
         flush=True,
     )
+    if returncode != 0 and stdout_path is not None:
+        stdout_tail = read_text_tail(stdout_path, min(stdout_log_max_bytes, 8192))
+        if stdout_tail:
+            print(
+                f"BigCode eval failed at step {global_step}; stdout tail from {stdout_path}:",
+                flush=True,
+            )
+            print(stdout_tail, flush=True)
     append_jsonl(
         log_path,
         {
