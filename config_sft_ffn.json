@@ -1,0 +1,279 @@
+{
+  "run_name": "lightlm-ffn-code-sft",
+  "seed": 1438,
+  "paths": {
+    "output_dir": "sft_runs/lightlm-ffn-code-sft",
+    "manifest_path": "sft_runs/lightlm-ffn-code-sft/sft_manifest.json",
+    "train_log_file": "sft_runs/lightlm-ffn-code-sft/logs/train.jsonl",
+    "eval_log_file": "sft_runs/lightlm-ffn-code-sft/logs/eval.jsonl",
+    "checkpoint_dir": "sft_runs/lightlm-ffn-code-sft/checkpoints"
+  },
+  "logging": {
+    "jsonl_max_bytes": 1048576
+  },
+  "model": {
+    "base_checkpoint": "Virg1n/LightLM",
+    "base_checkpoint_subfolder": "Model FFN",
+    "tokenizer_name": "HuggingFaceTB/SmolLM-360M",
+    "resume_checkpoint": "cpt_runs/lightlm-ffn-code-cpt/checkpoints/cpt_best.pt",
+    "variant": "ffn",
+    "num_dims": 512,
+    "num_heads": 16,
+    "num_kv_heads": 4,
+    "num_layers": 32,
+    "ffn_hidden_dims": 2048,
+    "rmsnorm_eps": 1e-6,
+    "rope_theta": 100000.0,
+    "context_len": 4096,
+    "use_cache": true,
+    "use_flash": true,
+    "use_moe": false,
+    "moe_num_experts": 2,
+    "moe_active_experts": 2,
+    "moe_eps": 1e-6,
+    "moe_aux_loss_coef": 0.01,
+    "moe_shared_experts": 1,
+    "use_lossfreebalance": false
+  },
+  "special_tokens": {
+    "additional_special_tokens": [
+      "<fim_prefix>",
+      "<fim_middle>",
+      "<fim_suffix>",
+      "<fim_pad>",
+      "<filename>"
+    ],
+    "fim_prefix": "<fim_prefix>",
+    "fim_middle": "<fim_middle>",
+    "fim_suffix": "<fim_suffix>",
+    "fim_pad": "<fim_pad>",
+    "filename": "<filename>",
+    "init_seed_words": {
+      "<fim_prefix>": ["prefix", "begin", "before", "context"],
+      "<fim_middle>": ["middle", "insert", "fill", "code"],
+      "<fim_suffix>": ["suffix", "end", "after", "context"],
+      "<fim_pad>": ["pad", "padding", "blank"],
+      "<filename>": ["filename", "file", "path", "module"]
+    }
+  },
+  "tokens": {
+    "target_total_tokens": 0
+  },
+  "training": {
+    "distributed": true,
+    "dtype": "bfloat16",
+    "compile": true,
+    "gradient_checkpointing": true,
+    "max_seq_len": 4096,
+    "per_device_batch_size": 2,
+    "gradient_accumulation_steps": 16,
+    "expected_gpus": 4,
+    "max_steps": 2000,
+    "resume_optimizer": false,
+    "learning_rate": 0.00002,
+    "min_learning_rate": 0.000002,
+    "warmup_start_learning_rate": 0.000002,
+    "warmup_ratio": 0.03,
+    "weight_decay": 0.05,
+    "betas": [0.9, 0.95],
+    "grad_clip": 1.0,
+    "checkpoint_interval_steps": 250,
+    "eval_interval_steps": 250,
+    "max_checkpoints_to_keep": 5,
+    "log_interval_steps": 10,
+    "best_loss_ema_alpha": 0.1
+  },
+  "evaluation": {
+    "bigcode_harness": {
+      "enabled": true,
+      "initial_eval_enabled": true,
+      "final_eval_enabled": true,
+      "interval_steps": 250,
+      "interval_tokens": 0,
+      "score_task": "humaneval",
+      "score_metric": "pass@1",
+      "tie_break_task": "mbpp",
+      "tie_break_metric": "pass@1",
+      "metric_output_path": "{output_dir}/eval_results_step_{step}.json",
+      "stdout_log_file": "{output_dir}/logs/eval_stdout_step_{step}.log",
+      "stdout_log_mode": "tail",
+      "stdout_log_max_bytes": 131072,
+      "command": [
+        "accelerate",
+        "launch",
+        "--num_processes",
+        "4",
+        "--main_process_port",
+        "29541",
+        "main.py",
+        "--model",
+        "{eval_model}",
+        "--trust_remote_code",
+        "--precision",
+        "bf16",
+        "--tasks",
+        "humaneval,mbpp",
+        "--max_length_generation",
+        "1024",
+        "--temperature",
+        "0.2",
+        "--n_samples",
+        "1",
+        "--batch_size",
+        "1",
+        "--metric_output_path",
+        "{metric_output_path}",
+        "--top_k",
+        "0",
+        "--top_p",
+        "1.0",
+        "--do_sample",
+        "False",
+        "--seed",
+        "0",
+        "--save_generations",
+        "--save_generations_path",
+        "{output_dir}/generations_step_{step}.json",
+        "--allow_code_execution"
+      ],
+      "cwd": "server_humaneval_eval/bigcode-evaluation-harness",
+      "eval_model": "{output_dir}"
+    }
+  },
+  "data": {
+    "hf_token": null
+  },
+  "sft": {
+    "streaming": true,
+    "stream_shuffle_buffer": 10000,
+    "cycle_on_exhaustion": true,
+    "group_mix": {
+      "instruction": 0.7,
+      "raw_completion": 0.3
+    },
+    "sources": [
+      {
+        "id": "opencodeinstruct",
+        "enabled": true,
+        "group": "instruction",
+        "dataset": "nvidia/OpenCodeInstruct",
+        "split": "train",
+        "weight": 0.25,
+        "prompt_field": "input",
+        "completion_field": "output"
+      },
+      {
+        "id": "magicoder_oss_instruct",
+        "enabled": true,
+        "group": "instruction",
+        "dataset": "ise-uiuc/Magicoder-OSS-Instruct-75K",
+        "split": "train",
+        "weight": 0.20,
+        "prompt_field": "problem",
+        "completion_field": "solution"
+      },
+      {
+        "id": "magicoder_evol_instruct",
+        "enabled": true,
+        "group": "instruction",
+        "dataset": "ise-uiuc/Magicoder-Evol-Instruct-110K",
+        "split": "train",
+        "weight": 0.20,
+        "prompt_field": "instruction",
+        "completion_field": "response"
+      },
+      {
+        "id": "code_feedback",
+        "enabled": true,
+        "group": "instruction",
+        "dataset": "m-a-p/Code-Feedback",
+        "split": "train",
+        "weight": 0.10
+      },
+      {
+        "id": "code_ultra_feedback",
+        "enabled": true,
+        "group": "instruction",
+        "dataset": "coseal/CodeUltraFeedback",
+        "split": "train",
+        "weight": 0.10,
+        "prompt_field": "instruction"
+      },
+      {
+        "id": "self_code_align",
+        "enabled": true,
+        "group": "instruction",
+        "dataset": "AadiBhatia/self-code-align",
+        "split": "train",
+        "weight": 0.10
+      },
+      {
+        "id": "humaneval_synthetic_nonoverlap",
+        "enabled": true,
+        "group": "instruction",
+        "dataset": "json",
+        "data_files": "data/sft/humaneval_synthetic_nonoverlap.jsonl",
+        "split": "train",
+        "weight": 0.05,
+        "prompt_field": "prompt",
+        "completion_field": "completion"
+      },
+      {
+        "id": "starcoder_python_raw",
+        "enabled": true,
+        "group": "raw_completion",
+        "dataset": "bigcode/starcoderdata",
+        "data_dir": "python",
+        "split": "train",
+        "weight": 0.65,
+        "text_field": "content",
+        "docstring_probability": 0.4,
+        "requires_hf_access": true
+      },
+      {
+        "id": "starcoder_javascript_raw",
+        "enabled": true,
+        "group": "raw_completion",
+        "dataset": "bigcode/starcoderdata",
+        "data_dir": "javascript",
+        "split": "train",
+        "weight": 0.10,
+        "text_field": "content",
+        "requires_hf_access": true
+      },
+      {
+        "id": "starcoder_c_raw",
+        "enabled": true,
+        "group": "raw_completion",
+        "dataset": "bigcode/starcoderdata",
+        "data_dir": "c",
+        "split": "train",
+        "weight": 0.08,
+        "text_field": "content",
+        "requires_hf_access": true
+      },
+      {
+        "id": "starcoder_rust_raw",
+        "enabled": true,
+        "group": "raw_completion",
+        "dataset": "bigcode/starcoderdata",
+        "data_dir": "rust",
+        "split": "train",
+        "weight": 0.08,
+        "text_field": "content",
+        "requires_hf_access": true
+      },
+      {
+        "id": "starcoder_go_raw",
+        "enabled": true,
+        "group": "raw_completion",
+        "dataset": "bigcode/starcoderdata",
+        "data_dir": "go",
+        "split": "train",
+        "weight": 0.09,
+        "text_field": "content",
+        "requires_hf_access": true
+      }
+    ]
+  }
+}
