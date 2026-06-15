@@ -28,6 +28,7 @@ from cont_pretrain import (
     finite_score,
     get_dtype,
     init_special_embeddings,
+    initialize_dist_run_id,
     is_dist,
     load_resume_state,
     load_state_into_model,
@@ -783,6 +784,7 @@ def main() -> None:
     if config["training"].get("compile", False):
         suppress_known_compile_warnings()
     device, rank, _local_rank, world_size = setup_distributed(config)
+    initialize_dist_run_id()
     set_seed(int(config["seed"]), rank)
     torch.set_float32_matmul_precision("high")
 

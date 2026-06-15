@@ -86,7 +86,7 @@
   "evaluation": {
     "bigcode_harness": {
       "enabled": true,
-      "initial_eval_enabled": true,
+      "initial_eval_enabled": false,
       "final_eval_enabled": true,
       "interval_steps": 250,
       "interval_tokens": 0,
