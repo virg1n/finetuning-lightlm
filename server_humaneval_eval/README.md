@@ -110,7 +110,7 @@ You can override defaults with environment variables:
 MAX_LENGTH_GENERATION=1024 BATCH_SIZE=1 NUM_PROCESSES=1 ./run_humaneval.sh
 ```
 
-Use `MAX_LENGTH_GENERATION=1024` unless you intentionally want longer generations. This model has `context_len=1536`; 1024 leaves enough completion room for HumanEval and MBPP while avoiding very slow no-stop generations.
+Use `MAX_LENGTH_GENERATION=1024` for HumanEval unless you intentionally want longer generations. MBPP defaults to `1536`, the model's full context length, because some MBPP prompts/generations can hit a 1024 total-length cap in the BigCode harness.
 
 To use an already exported model:
 

@@ -34,17 +34,17 @@ SEED="${SEED:-0}"
 
 mkdir -p "$OUTPUT_DIR"
 
-if [ ! -f "$CHECKPOINT_PATH" ]; then
-  echo "Downloading checkpoint to $CHECKPOINT_PATH"
-  python download_checkpoint.py \
-    --repo-id "$HF_REPO" \
-    --filename "$HF_FILENAME" \
-    --local-dir .
-else
-  echo "Using existing checkpoint: $CHECKPOINT_PATH"
-fi
-
 if [ "${SKIP_EXPORT:-0}" != "1" ]; then
+  if [ ! -f "$CHECKPOINT_PATH" ]; then
+    echo "Downloading checkpoint to $CHECKPOINT_PATH"
+    python download_checkpoint.py \
+      --repo-id "$HF_REPO" \
+      --filename "$HF_FILENAME" \
+      --local-dir .
+  else
+    echo "Using existing checkpoint: $CHECKPOINT_PATH"
+  fi
+
   echo "Exporting native checkpoint to HF model directory: $MODEL_DIR"
   python export_checkpoint.py \
     --checkpoint "$CHECKPOINT_PATH" \
