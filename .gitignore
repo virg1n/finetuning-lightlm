@@ -8,3 +8,4 @@
 
 /cpt_runs/
 /.venv_cuda/
+/server_humaneval_eval/bigcode-evaluation-harness/

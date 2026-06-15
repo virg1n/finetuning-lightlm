@@ -102,7 +102,7 @@
         "accelerate",
         "launch",
         "--num_processes",
-        "4",
+        "1",
         "--main_process_port",
         "29541",
         "main.py",
